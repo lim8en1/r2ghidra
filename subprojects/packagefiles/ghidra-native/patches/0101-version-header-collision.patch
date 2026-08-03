@@ -1,0 +1,27 @@
+diff --git a/Makefile b/Makefile
+index 4234b77..504ce03 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,7 @@ sync-ghidra ghidra-sync sync-decompiler decompiler-sync: ghidra
+ 	rm -rf src/Processor/*/src
+ 	rm -rf src/Processors/*/src
+ 
+-V=$(shell cat VERSION)
++V=$(shell cat VERSION.txt)
+ D=ghidra-native-$(V)
+ 
+ dist:
+diff --git a/VERSION b/VERSION
+deleted file mode 100644
+index d2b13eb..0000000
+--- a/VERSION
++++ /dev/null
+@@ -1 +0,0 @@
+-0.6.4
+diff --git a/VERSION.txt b/VERSION.txt
+new file mode 100644
+index 0000000..d2b13eb
+--- /dev/null
++++ b/VERSION.txt
+@@ -0,0 +1 @@
++0.6.4
