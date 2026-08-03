@@ -63,6 +63,7 @@ decompiler_sources = [
   'src/decompiler/crc32.cc',
   'src/decompiler/prettyprint.cc',
   'src/decompiler/printlanguage.cc',
+  'src/decompiler/signature.cc',
   'src/decompiler/printc.cc',
   'src/decompiler/printjava.cc',
   'src/decompiler/memstate.cc',
