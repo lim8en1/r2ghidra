@@ -10,6 +10,7 @@
 #include "PcodeFixupPreprocessor.h"
 #include "R2Utils.h"
 #include "r2harvest.h"
+#include "r2fillstruct.h"
 #include "signature.hh"
 #include "r2ghidra.h"
 #include <r_core.h>
@@ -125,6 +126,7 @@ static const char* r2ghidra_help[] = {
 	"pd:gs", "", "# Display loaded Sleigh Languages (alias for pdgL)",
 	"pd:gsd", " N", "# Disassemble N instructions with Sleigh and print pcode",
 	"pd:gss", "", "# Display automatically matched Sleigh Language ID",
+	"pd:gt", " [var]", "# Recover a struct from var's access pattern and apply it to var",
 	"pd:gw", "", "# Decompile and write recovered names, types and signature back into r2",
 	"pd:gx", "", "# Dump the XML of the current decompiled function",
 	"Environment:", "", "",
@@ -150,7 +152,8 @@ enum class DecompileMode {
 	WRITE,
 	FIELDS,
 	CFG,
-	SIGNATURE
+	SIGNATURE,
+	STRUCTURE
 };
 
 // Walks every CPUI_PTRSUB ("drill down to a sub-field", i.e. struct/union
@@ -475,7 +478,7 @@ static void seedGlobalPointerRegister(R2Architecture &arch, RCore *core, RAnalFu
 	});
 }
 
-static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RCodeMeta **out_code, Harvest *out_harvest = nullptr) {
+static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RCodeMeta **out_code, Harvest *out_harvest = nullptr, const char *fillVarName = nullptr) {
 	RAnalFunction *function = r_anal_get_fcn_in (core->anal, addr, R_ANAL_FCN_TYPE_NULL);
 	if (!function) {
 		throw LowlevelError ("No function at this offset");
@@ -546,6 +549,14 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	}
 	if (mode == DecompileMode::SIGNATURE) {
 		HarvestSignature (func, out_stream);
+		return;
+	}
+	if (mode == DecompileMode::STRUCTURE) {
+		std::string err;
+		if (!FillOutStructure (core, arch, func, fillVarName ? fillVarName : "", err)) {
+			throw LowlevelError (err);
+		}
+		out_stream << "{\"applied\":true}";
 		return;
 	}
 	switch (mode) {
@@ -716,9 +727,9 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
 		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG
-		    || mode == DecompileMode::SIGNATURE) {
-			// FIELDS (pdgf), CFG (pdgc), and SIGNATURE (pdgv) have no
-			// RCodeMeta/text output to fall back on -- without this, a
+		    || mode == DecompileMode::SIGNATURE || mode == DecompileMode::STRUCTURE) {
+			// FIELDS (pdgf), CFG (pdgc), SIGNATURE (pdgv), and STRUCTURE (pdgt)
+			// have no RCodeMeta/text output to fall back on -- without this, a
 			// decompile failure produces empty stdout, indistinguishable
 			// from "decompiled fine, zero results."
 			PJ *pj = pj_new ();
@@ -734,6 +745,37 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 			}
 		} else {
 			R_LOG_WARN ("%s", s.c_str ());
+		}
+	}
+#endif
+}
+
+static void DecompileCmdStructure(RCore *core, const char *varName) {
+	DecompilerLock lock(core);
+	if (!varName || !*varName) {
+		R_LOG_ERROR ("pdgt: variable name required, e.g. pdgt param1");
+		return;
+	}
+#ifndef DEBUG_EXCEPTIONS
+	try {
+#endif
+		RCodeMeta *code = nullptr;
+		std::stringstream out_stream;
+		Decompile (core, core->addr, DecompileMode::STRUCTURE, out_stream, &code, nullptr, varName);
+		r_cons_printf (core->cons, "%s\n", out_stream.str ().c_str ());
+#ifndef DEBUG_EXCEPTIONS
+	} catch (const LowlevelError &error) {
+		std::string s = "Ghidra Decompiler Error: " + error.explain;
+		PJ *pj = pj_new ();
+		if (pj) {
+			pj_o (pj);
+			pj_k (pj, "errors");
+			pj_a (pj);
+			pj_s (pj, s.c_str ());
+			pj_end (pj);
+			pj_end (pj);
+			r_cons_printf (core->cons, "%s\n", pj_string (pj));
+			pj_free (pj);
 		}
 	}
 #endif
@@ -949,6 +991,9 @@ static void runcmd(RCore *core, const char *input) {
 	case 'w': // "pdgw"
 		DecompileCmd (core, DecompileMode::WRITE);
 		break;
+	case 't': // "pdgt"
+		DecompileCmdStructure (core, r_str_trim_head_ro (input + 1));
+		break;
 	case 'p': // "pdgp"
 		EnablePlugin (core);
 		break;
@@ -960,8 +1005,8 @@ static void runcmd(RCore *core, const char *input) {
 
 static void _cmd(RCore *core, const char *input) {
 	int timeout = r_config_get_i (core->config, "r2ghidra.timeout");
-	if (*input == 'w') {
-		// pdgw writes into the r2 DB; a forked child would lose the writes
+	if (*input == 'w' || *input == 't') {
+		// pdgw/pdgt write into the r2 DB; a forked child would lose the writes
 		runcmd (core, input);
 		return;
 	}

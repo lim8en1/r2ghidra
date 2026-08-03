@@ -1,0 +1,103 @@
+diff --git a/src/decompiler/ruleaction.cc b/src/decompiler/ruleaction.cc
+index 0912e4f..f4d4b56 100644
+--- a/src/decompiler/ruleaction.cc
++++ b/src/decompiler/ruleaction.cc
+@@ -18,6 +18,32 @@
+ #include "rangeutil.hh"
+ #include "multiprecision.hh"
+ 
++#include <map>
++
++namespace ghidra {
++// ptrarith/ptrsubundo oscillation fix (research/structures_r2ghidra/README.md
++// -- confirmed via live instrumentation this session to be a genuine,
++// non-terminating disagreement between these two rules over the same
++// instruction when an offset lands inside a padding gap rather than a real
++// field). Keyed on instruction address only (not (address, offset) pairs):
++// the observed oscillation was driven by a single instruction address for
++// its entire duration, so address alone is sufficient. Cleared once per
++// fresh decompile via RulePtrsubUndo::reset (Rule::reset's documented
++// purpose -- "purge state for each new function to be transformed" --
++// ActionPool::reset calls reset() on every rule in the pool at the start
++// of every decompile), so there is no cross-decompile/cross-function
++// staleness risk despite this being a plain namespace-scoped map rather
++// than something keyed by Funcdata identity.
++static std::map<uintb, int4> ptrsubUndoCounts;
++// Threshold before RulePtrArith is suppressed at a given instruction: a
++// single wrong-guess-then-corrected-then-different-correct-guess sequence
++// is normal, legitimate iterative refinement (see RulePtrsubUndo's own
++// docstring) and must not be blocked after just one undo. Only genuine
++// repeating oscillation -- the pattern actually observed, tens of
++// thousands of identical repeats -- should trigger suppression.
++static const int4 PTRSUBUNDO_OSCILLATION_THRESHOLD = 3;
++}
++
+ namespace ghidra {
+ 
+ /// \class RuleEarlyRemoval
+@@ -6641,6 +6667,18 @@ int4 RulePtrArith::applyOp(PcodeOp *op,Funcdata &data)
+ 
+   if (!data.hasTypeRecoveryStarted()) return 0;
+ 
++  // ptrarith/ptrsubundo oscillation fix -- see the namespace-scoped
++  // ptrsubUndoCounts comment near the top of this file. If ptrsubundo has
++  // repeatedly reverted a PTRSUB at this exact instruction, stop
++  // re-proposing one: the offset genuinely doesn't resolve to a real
++  // field (padding gap or similar), and further attempts only oscillate.
++  {
++    std::map<uintb, int4>::const_iterator oscIter = ptrsubUndoCounts.find(op->getAddr().getOffset());
++    if (oscIter != ptrsubUndoCounts.end() && oscIter->second >= PTRSUBUNDO_OSCILLATION_THRESHOLD) {
++      return 0;
++    }
++  }
++
+   for(slot=0;slot<op->numInput();++slot) { // Search for pointer type
+     ct = op->getIn(slot)->getTypeReadFacing(op);
+     if (ct->getMetatype() == TYPE_PTR) break;
+@@ -7116,6 +7154,13 @@ int4 RulePtrsubUndo::applyOp(PcodeOp *op,Funcdata &data)
+   if (basevn->getTypeReadFacing(op)->isPtrsubMatching(val,extra,multiplier))
+     return 0;
+ 
++  // ptrarith/ptrsubundo oscillation fix -- see the namespace-scoped
++  // ptrsubUndoCounts comment near the top of this file. Record that this
++  // instruction's PTRSUB was just reverted, so RulePtrArith can detect and
++  // stop a repeating oscillation rather than immediately re-proposing the
++  // same rejected conversion.
++  ptrsubUndoCounts[op->getAddr().getOffset()] += 1;
++
+   data.opSetOpcode(op,CPUI_INT_ADD);
+   op->clearStopTypePropagation();
+   extra = removeLocalAdds(op->getOut(),data);
+@@ -7125,7 +7170,19 @@ int4 RulePtrsubUndo::applyOp(PcodeOp *op,Funcdata &data)
+   }
+   return 1;
+ }
+-  
++
++/// Clears the per-decompile oscillation-tracking state (see the
++/// namespace-scoped ptrsubUndoCounts comment near the top of this file) --
++/// invoked once per fresh decompile via the standard Rule::reset lifecycle
++/// (ActionPool::reset calls reset() on every rule in its pool at the start
++/// of each decompile).
++void RulePtrsubUndo::reset(Funcdata &data)
++
++{
++  Rule::reset(data);
++  ptrsubUndoCounts.clear();
++}
++
+ // Clean up rules
+ 
+ /// \class RuleMultNegOne
+diff --git a/src/decompiler/ruleaction.hh b/src/decompiler/ruleaction.hh
+index 5b8c80d..e5abfd1 100644
+--- a/src/decompiler/ruleaction.hh
++++ b/src/decompiler/ruleaction.hh
+@@ -1126,6 +1126,7 @@ public:
+   }
+   virtual void getOpList(vector<uint4> &oplist) const;
+   virtual int4 applyOp(PcodeOp *op,Funcdata &data);
++  virtual void reset(Funcdata &data);
+ };
+ 
+ // Cleanup rules

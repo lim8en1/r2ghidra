@@ -23,6 +23,7 @@ r2ghidra_sources = [
   'src/SleighInstruction.cpp',
   'src/PcodeFixupPreprocessor.cpp',
   'src/r2harvest.cpp',
+  'src/r2fillstruct.cpp',
 ]
 
 incdirs = [
