@@ -115,6 +115,7 @@ static const char* r2ghidra_help[] = {
 	"pd:g*", "", "# Decompiled code is returned to r2 as comment",
 	"pd:ga", "", "# Side by side two column disasm and decompilation",
 	"pd:gd", "", "# Dump the debug XML Dump",
+	"pd:gc", "", "# Dump per-function CFG (blocks/edges/op-counts) as JSON",
 	"pd:gf", "", "# Dump resolved struct field accesses (struct/field/offset/width) as JSON",
 	"pd:gj", "", "# Dump the current decompiled function as JSON",
 	"pd:go", "", "# Decompile current function side by side with offsets",
@@ -145,7 +146,8 @@ enum class DecompileMode {
 	DISASM,
 	JSON,
 	WRITE,
-	FIELDS
+	FIELDS,
+	CFG
 };
 
 // Walks every CPUI_PTRSUB ("drill down to a sub-field", i.e. struct/union
@@ -315,6 +317,70 @@ static void HarvestFieldAccesses(Funcdata *func, std::stringstream &out) {
 	out << "]";
 }
 
+// Walks the fully-analyzed Funcdata's own basic-block graph (the same
+// BlockGraph the decompiler itself uses to render control flow -- nothing
+// here duplicates instruction text/mnemonics, that stays in pdgf/pdg/
+// capstone territory) and emits, per block: id, address range, op count,
+// and predecessor/successor block ids. This is the CFG-shape data needed
+// for binary-diffing heuristics (node/edge/loop/strongly-connected-
+// component comparison) that no stock r2 JSON command currently exposes at
+// the per-function level (agj/afbj are r2-native-analysis-derived, not
+// Ghidra's own post-decompilation block graph).
+static void HarvestCFG(Funcdata *func, std::stringstream &out) {
+	const BlockGraph &blocks = func->getBasicBlocks ();
+	int4 numBlocks = blocks.getSize ();
+
+	out << "{\"entry\":";
+	// getStartBlock() is the block containing the function's entry point --
+	// same "first block to execute" concept as getEntryAddr() on a single
+	// block, just asked of the whole graph.
+	const FlowBlock *entry = numBlocks > 0 ? blocks.getStartBlock () : nullptr;
+	out << (entry ? entry->getIndex () : -1);
+	out << ",\"blocks\":[";
+
+	for (int4 i = 0; i < numBlocks; ++i) {
+		if (i > 0) {
+			out << ",";
+		}
+		const FlowBlock *block = blocks.getBlock (i);
+		out << "{";
+		out << "\"id\":" << block->getIndex () << ",";
+		out << "\"start\":" << block->getStart ().getOffset () << ",";
+		out << "\"stop\":" << block->getStop ().getOffset () << ",";
+
+		int4 opCount = 0;
+		if (block->getType () == FlowBlock::t_basic) {
+			const BlockBasic *bb = (const BlockBasic *)block;
+			for (auto iter = bb->beginOp (); iter != bb->endOp (); ++iter) {
+				opCount++;
+			}
+		}
+		out << "\"op_count\":" << opCount << ",";
+
+		out << "\"preds\":[";
+		int4 sizeIn = block->sizeIn ();
+		for (int4 j = 0; j < sizeIn; ++j) {
+			if (j > 0) {
+				out << ",";
+			}
+			out << block->getIn (j)->getIndex ();
+		}
+		out << "],";
+
+		out << "\"succs\":[";
+		int4 sizeOut = block->sizeOut ();
+		for (int4 j = 0; j < sizeOut; ++j) {
+			if (j > 0) {
+				out << ",";
+			}
+			out << block->getOut (j)->getIndex ();
+		}
+		out << "]";
+		out << "}";
+	}
+	out << "]}";
+}
+
 static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c) {
 	if (!print_c) {
 		return;
@@ -430,6 +496,10 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	}
 	if (mode == DecompileMode::FIELDS) {
 		HarvestFieldAccesses (func, out_stream);
+		return;
+	}
+	if (mode == DecompileMode::CFG) {
+		HarvestCFG (func, out_stream);
 		return;
 	}
 	switch (mode) {
@@ -599,10 +669,11 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 #ifndef DEBUG_EXCEPTIONS
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
-		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS) {
-			// FIELDS (pdgf) has no RCodeMeta/text output to fall back on --
-			// without this, a decompile failure produces empty stdout,
-			// indistinguishable from "decompiled fine, zero field accesses."
+		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG) {
+			// FIELDS (pdgf) and CFG (pdgc) have no RCodeMeta/text output to
+			// fall back on -- without this, a decompile failure produces
+			// empty stdout, indistinguishable from "decompiled fine, zero
+			// results."
 			PJ *pj = pj_new ();
 			if (pj) {
 				pj_o (pj);
@@ -798,6 +869,9 @@ static void runcmd(RCore *core, const char *input) {
 		break;
 	case 'f': // "pdgf"
 		DecompileCmd (core, DecompileMode::FIELDS);
+		break;
+	case 'c': // "pdgc"
+		DecompileCmd (core, DecompileMode::CFG);
 		break;
 	case 'o': // "pdgo"
 		DecompileCmd (core, DecompileMode::OFFSET);
