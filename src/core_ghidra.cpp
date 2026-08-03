@@ -115,6 +115,7 @@ static const char* r2ghidra_help[] = {
 	"pd:g*", "", "# Decompiled code is returned to r2 as comment",
 	"pd:ga", "", "# Side by side two column disasm and decompilation",
 	"pd:gd", "", "# Dump the debug XML Dump",
+	"pd:gf", "", "# Dump resolved struct field accesses (struct/field/offset/width) as JSON",
 	"pd:gj", "", "# Dump the current decompiled function as JSON",
 	"pd:go", "", "# Decompile current function side by side with offsets",
 	"pd:gp", "", "# Switch to RAsm and RAnal plugins driven by SLEIGH from Ghidra",
@@ -143,8 +144,176 @@ enum class DecompileMode {
 	STATEMENTS,
 	DISASM,
 	JSON,
-	WRITE
+	WRITE,
+	FIELDS
 };
+
+// Walks every CPUI_PTRSUB ("drill down to a sub-field", i.e. struct/union
+// field access) pcode op in the fully-analyzed Funcdata and resolves it back
+// to (struct name, field name, offset, width) using the same native
+// Datatype/TypeStruct API the decompiler itself uses to render `var->field`
+// in C output -- this is the same class of fact angr's CVariableField/
+// CStructField AST nodes carry, just read directly off Ghidra's internal
+// pcode instead of off a rendered structured-C tree. No JVM/Java involved:
+// this runs in the same native process as the rest of r2ghidra.
+static void HarvestFieldAccesses(Funcdata *func, std::stringstream &out) {
+	bool first = true;
+	out << "[";
+
+	auto emit = [&](uint8 addr, const char *kind, const std::string &var,
+	                 const std::string &structName, const std::string &fieldName,
+	                 int8 offset, int4 width, const std::string &fieldType) {
+		if (!first) {
+			out << ",";
+		}
+		first = false;
+		out << "{";
+		out << "\"addr\":" << addr << ",";
+		out << "\"kind\":\"" << kind << "\",";
+		out << "\"var\":\"" << var << "\",";
+		out << "\"struct\":\"" << structName << "\",";
+		out << "\"field\":\"" << fieldName << "\",";
+		out << "\"offset\":" << offset << ",";
+		out << "\"width\":" << width << ",";
+		out << "\"field_type\":\"" << fieldType << "\"";
+		out << "}";
+	};
+
+	for (auto iter = func->beginOpAll (); iter != func->endOpAll (); ++iter) {
+		PcodeOp *op = iter->second;
+		OpCode oc = op->code ();
+
+		// Case 1: Ghidra has already recognized this as pointer-relative
+		// field access (may or may not know the pointed-to type is a named
+		// struct -- if it doesn't, struct/field come back empty and this is
+		// equivalent to angr's "raw offset, no struct yet" harvest).
+		if (oc == CPUI_PTRSUB && op->numInput () >= 2) {
+			Varnode *baseVn = op->getIn (0);
+			Varnode *offVn = op->getIn (1);
+			if (!baseVn || !offVn || !offVn->isConstant ()) {
+				continue;
+			}
+			Datatype *baseType = baseVn->getType ();
+			if (!baseType || baseType->getMetatype () != TYPE_PTR) {
+				continue;
+			}
+			Datatype *pointedTo = ((TypePointer *)baseType)->getPtrTo ();
+			if (!pointedTo) {
+				continue;
+			}
+			int8 offset = (int8)sign_extend (offVn->getOffset (), offVn->getSize (), sizeof (uintb));
+			// A PTRSUB's "offset" operand is occasionally not a small
+			// in-struct offset at all -- e.g. an absolute address folded
+			// into the same op shape (observed: ~5.3 billion on real data).
+			// Real struct fields are never remotely this large; reject
+			// rather than emit garbage. Bound the MAGNITUDE, not the sign --
+			// small negative offsets are legitimate (e.g. a pointer derived
+			// from `base + K` used to access `base`-relative fields, seen
+			// correctly on real data as offset -56/-48). Generous ceiling
+			// (not pointedTo's own declared size) since legitimate widening
+			// evidence can validly exceed an incomplete/anonymous type's
+			// current size.
+			static const int8 PLAUSIBLE_OFFSET_CEILING = 0x10000;
+			if (offset > PLAUSIBLE_OFFSET_CEILING || offset < -PLAUSIBLE_OFFSET_CEILING) {
+				continue;
+			}
+			Varnode *outVn = op->getOut ();
+			int4 width = outVn ? outVn->getSize () : 0;
+
+			std::string fieldName, fieldTypeName;
+			int8 fieldOffset = offset;
+			if (pointedTo->getMetatype () == TYPE_STRUCT) {
+				int8 newoff = 0;
+				const TypeField *tf = ((TypeStruct *)pointedTo)->findTruncation (offset, width, op, 0, newoff);
+				if (tf) {
+					fieldName = tf->name;
+					fieldOffset = tf->offset;
+					if (tf->type) {
+						fieldTypeName = tf->type->getName ();
+					}
+				}
+			}
+			emit (op->getAddr ().getOffset (), "ptrsub", "", pointedTo->getName (),
+			      fieldName, fieldOffset, width, fieldTypeName);
+			continue;
+		}
+
+		// Case 2: no pointer-type recognition at all yet -- plain
+		// `base_var + constant` immediately consumed by a LOAD/STORE. This
+		// is the common case for a genuinely untyped variable and mirrors
+		// angr's raw `*(T*)(var + N)` cast pattern exactly: nothing here
+		// depends on Ghidra having inferred any type for the base variable,
+		// only that it's a real (non-temporary) variable with a name.
+		if (oc == CPUI_INT_ADD && op->numInput () >= 2) {
+			Varnode *in0 = op->getIn (0);
+			Varnode *in1 = op->getIn (1);
+			Varnode *baseVn = nullptr;
+			Varnode *offVn = nullptr;
+			if (in0 && in1 && in1->isConstant () && !in0->isConstant ()) {
+				baseVn = in0;
+				offVn = in1;
+			} else if (in0 && in1 && in0->isConstant () && !in1->isConstant ()) {
+				baseVn = in1;
+				offVn = in0;
+			}
+			if (!baseVn || !offVn) {
+				continue;
+			}
+			HighVariable *high = nullptr;
+			try {
+				high = baseVn->getHigh ();
+			} catch (const LowlevelError &) {
+				continue;
+			}
+			if (!high) {
+				continue;
+			}
+			// Prefer a real declared name (Symbol), but most interesting
+			// base pointers here are decompiler-internal temporaries with
+			// no Symbol at all -- same situation as angr's "unified
+			// variable with no source-level name yet" case, which our own
+			// walker still harvests from. Fall back to a stable synthetic
+			// id (SSA create-index) so accesses through the same computed
+			// pointer still group together correctly.
+			Symbol *sym = high->getSymbol ();
+			std::string varName;
+			if (sym) {
+				varName = sym->getName ();
+			} else {
+				varName = "tmp_" + std::to_string (baseVn->getCreateIndex ());
+			}
+			Varnode *addOut = op->getOut ();
+			if (!addOut) {
+				continue;
+			}
+			int8 offset = (int8)sign_extend (offVn->getOffset (), offVn->getSize (), sizeof (uintb));
+			for (auto dit = addOut->beginDescend (); dit != addOut->endDescend (); ++dit) {
+				PcodeOp *user = *dit;
+				const char *kind;
+				int4 width;
+				if (user->code () == CPUI_LOAD) {
+					Varnode *loadOut = user->getOut ();
+					if (!loadOut) {
+						continue;
+					}
+					kind = "load";
+					width = loadOut->getSize ();
+				} else if (user->code () == CPUI_STORE && user->numInput () >= 3) {
+					Varnode *storeVal = user->getIn (2);
+					if (!storeVal) {
+						continue;
+					}
+					kind = "store";
+					width = storeVal->getSize ();
+				} else {
+					continue;
+				}
+				emit (user->getAddr ().getOffset (), kind, varName, "", "", offset, width, "");
+			}
+		}
+	}
+	out << "]";
+}
 
 static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c) {
 	if (!print_c) {
@@ -257,6 +426,10 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	}
 	if (out_harvest) {
 		HarvestFuncdata (arch, func, *out_harvest);
+		return;
+	}
+	if (mode == DecompileMode::FIELDS) {
+		HarvestFieldAccesses (func, out_stream);
 		return;
 	}
 	switch (mode) {
@@ -426,7 +599,10 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 #ifndef DEBUG_EXCEPTIONS
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
-		if (mode == DecompileMode::JSON) {
+		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS) {
+			// FIELDS (pdgf) has no RCodeMeta/text output to fall back on --
+			// without this, a decompile failure produces empty stdout,
+			// indistinguishable from "decompiled fine, zero field accesses."
 			PJ *pj = pj_new ();
 			if (pj) {
 				pj_o (pj);
@@ -619,6 +795,9 @@ static void runcmd(RCore *core, const char *input) {
 		break;
 	case 'j': // "pdgj"
 		DecompileCmd (core, DecompileMode::JSON);
+		break;
+	case 'f': // "pdgf"
+		DecompileCmd (core, DecompileMode::FIELDS);
 		break;
 	case 'o': // "pdgo"
 		DecompileCmd (core, DecompileMode::OFFSET);
