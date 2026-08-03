@@ -10,6 +10,7 @@
 #include "PcodeFixupPreprocessor.h"
 #include "R2Utils.h"
 #include "r2harvest.h"
+#include "signature.hh"
 #include "r2ghidra.h"
 #include <r_core.h>
 
@@ -117,6 +118,7 @@ static const char* r2ghidra_help[] = {
 	"pd:gd", "", "# Dump the debug XML Dump",
 	"pd:gc", "", "# Dump per-function CFG (blocks/edges/op-counts) as JSON",
 	"pd:gf", "", "# Dump resolved struct field accesses (struct/field/offset/width) as JSON",
+	"pd:gv", "", "# Dump BSim-style feature-hash vector for the current function as JSON",
 	"pd:gj", "", "# Dump the current decompiled function as JSON",
 	"pd:go", "", "# Decompile current function side by side with offsets",
 	"pd:gp", "", "# Switch to RAsm and RAnal plugins driven by SLEIGH from Ghidra",
@@ -147,7 +149,8 @@ enum class DecompileMode {
 	JSON,
 	WRITE,
 	FIELDS,
-	CFG
+	CFG,
+	SIGNATURE
 };
 
 // Walks every CPUI_PTRSUB ("drill down to a sub-field", i.e. struct/union
@@ -381,6 +384,45 @@ static void HarvestCFG(Funcdata *func, std::stringstream &out) {
 	out << "]}";
 }
 
+// Generates a BSim-style feature-hash vector for the fully-analyzed
+// Funcdata, using Ghidra's own GraphSigManager (signature.hh/.cc, already
+// vendored in this build's ghidra-native subproject but not previously
+// compiled in -- see ghidra/deps.mk). This is the exact same three-call
+// sequence upstream Ghidra's own simpleSignature() uses (setCurrentFunction
+// + generate + getSignatureVector) to feed BSim's Java-side LSH/cosine
+// -similarity search; here the plain hash vector is emitted directly as
+// JSON instead, since the LSH-index/weighting layer is a Python-side concern
+// for this project (see src/core/diffing/strategies/bsim_signature.py),
+// not something that needs a native equivalent.
+static void HarvestSignature(Funcdata *func, std::stringstream &out) {
+	// SigManager::settings is a static, process-wide "must be set before
+	// any GraphSigManager is constructed" value (enforced by
+	// GraphSigManager's own constructor, which throws LowlevelError
+	// otherwise) -- not per-instance, so this only needs setting once.
+	// SIG_DONOTUSE_CONST | SIG_COLLAPSE_INDNOISE matches signature.cc's own
+	// suggested-defaults comment on SigManager::settings' declaration.
+	static bool signatureSettingsInitialized = false;
+	if (!signatureSettingsInitialized) {
+		SigManager::setSettings(((GraphSigManager::SIG_DONOTUSE_CONST | GraphSigManager::SIG_COLLAPSE_INDNOISE) << 2) | 1);
+		signatureSettingsInitialized = true;
+	}
+
+	GraphSigManager sigmanager;
+	sigmanager.setCurrentFunction(func);
+	sigmanager.generate();
+	vector<uint4> feature;
+	sigmanager.getSignatureVector(feature);
+
+	out << "[";
+	for (size_t i = 0; i < feature.size(); ++i) {
+		if (i > 0) {
+			out << ",";
+		}
+		out << feature[i];
+	}
+	out << "]";
+}
+
 static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c) {
 	if (!print_c) {
 		return;
@@ -500,6 +542,10 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	}
 	if (mode == DecompileMode::CFG) {
 		HarvestCFG (func, out_stream);
+		return;
+	}
+	if (mode == DecompileMode::SIGNATURE) {
+		HarvestSignature (func, out_stream);
 		return;
 	}
 	switch (mode) {
@@ -669,11 +715,12 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 #ifndef DEBUG_EXCEPTIONS
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
-		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG) {
-			// FIELDS (pdgf) and CFG (pdgc) have no RCodeMeta/text output to
-			// fall back on -- without this, a decompile failure produces
-			// empty stdout, indistinguishable from "decompiled fine, zero
-			// results."
+		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG
+		    || mode == DecompileMode::SIGNATURE) {
+			// FIELDS (pdgf), CFG (pdgc), and SIGNATURE (pdgv) have no
+			// RCodeMeta/text output to fall back on -- without this, a
+			// decompile failure produces empty stdout, indistinguishable
+			// from "decompiled fine, zero results."
 			PJ *pj = pj_new ();
 			if (pj) {
 				pj_o (pj);
@@ -872,6 +919,9 @@ static void runcmd(RCore *core, const char *input) {
 		break;
 	case 'c': // "pdgc"
 		DecompileCmd (core, DecompileMode::CFG);
+		break;
+	case 'v': // "pdgv"
+		DecompileCmd (core, DecompileMode::SIGNATURE);
 		break;
 	case 'o': // "pdgo"
 		DecompileCmd (core, DecompileMode::OFFSET);

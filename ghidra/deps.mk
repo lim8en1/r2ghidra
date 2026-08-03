@@ -28,7 +28,7 @@ G_DECOMPILER+=multiprecision.cc funcdata.cc funcdata_block.cc funcdata_varnode.c
 G_DECOMPILER+=funcdata_op.cc unionresolve.cc pcodeinject.cc heritage.cc prefersplit.cc
 G_DECOMPILER+=rangeutil.cc ruleaction.cc subflow.cc blockaction.cc
 G_DECOMPILER+=merge.cc double.cc coreaction.cc condexe.cc override.cc
-G_DECOMPILER+=dynamic.cc crc32.cc prettyprint.cc printlanguage.cc
+G_DECOMPILER+=dynamic.cc crc32.cc prettyprint.cc printlanguage.cc signature.cc
 G_DECOMPILER+=printc.cc printjava.cc memstate.cc opbehavior.cc
 G_DECOMPILER+=paramid.cc transform.cc string_ghidra.cc constseq.cc
 
