@@ -119,6 +119,7 @@ static const char* r2ghidra_help[] = {
 	"pd:gd", "", "# Dump the debug XML Dump",
 	"pd:gc", "", "# Dump per-function CFG (blocks/edges/op-counts) as JSON",
 	"pd:gf", "", "# Dump resolved struct field accesses (struct/field/offset/width) as JSON",
+	"pd:gh", "", "# Dump pdgj+pdgc+pdgv+pdgf together as JSON, from a single decompile",
 	"pd:gv", "", "# Dump BSim-style feature-hash vector for the current function as JSON",
 	"pd:gj", "", "# Dump the current decompiled function as JSON",
 	"pd:go", "", "# Decompile current function side by side with offsets",
@@ -153,7 +154,8 @@ enum class DecompileMode {
 	FIELDS,
 	CFG,
 	SIGNATURE,
-	STRUCTURE
+	STRUCTURE,
+	HARVEST
 };
 
 // Walks every CPUI_PTRSUB ("drill down to a sub-field", i.e. struct/union
@@ -559,6 +561,35 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 		out_stream << "{\"applied\":true}";
 		return;
 	}
+	if (mode == DecompileMode::HARVEST) {
+		// Every artifact the diffing pipeline needs, off this one Funcdata:
+		// pdgj's code+annotations plus pdgc's CFG, pdgv's signature vector and
+		// pdgf's field accesses. Running those as four separate commands means
+		// four R2Architecture constructions, four arch.init() sleigh loads and
+		// four action->perform() runs over the same function (plus four forks,
+		// see _cmd's r2ghidra.timeout path) -- all of it redundant.
+		std::stringstream cfg_out, sig_out, fields_out;
+		HarvestCFG (func, cfg_out);
+		HarvestSignature (func, sig_out);
+		HarvestFieldAccesses (func, fields_out);
+		// The code half has to come last: docFunction writes the marked-up XML
+		// into out_stream, ParseCodeXML consumes it, and only then is
+		// out_stream free to reuse for our own output.
+		arch.print->setMarkup (true);
+		arch.print->docFunction (func);
+		*out_code = ParseCodeXML (func, out_stream.str ().c_str ());
+		if (!*out_code) {
+			throw LowlevelError ("Failed to parse XML code from Decompiler");
+		}
+		out_stream.str (std::string ());
+		out_stream.clear ();
+		// The caller splices this onto r_codemeta_print_json's object -- see
+		// DecompileCmd's HARVEST case.
+		out_stream << "\"cfg\":" << cfg_out.str ()
+			<< ",\"signature\":" << sig_out.str ()
+			<< ",\"fields\":" << fields_out.str ();
+		return;
+	}
 	switch (mode) {
 	case DecompileMode::XML:
 	case DecompileMode::DEFAULT:
@@ -715,6 +746,22 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 				free (s);
 			}
 			break;
+		case DecompileMode::HARVEST:
+			{
+				// r_codemeta_print_json emits {"code":...,"annotations":[...]};
+				// Decompile left the remaining members (without braces) in
+				// out_stream. Splice rather than nest, so pdgh's "code"/
+				// "annotations" stay where a pdgj consumer expects them.
+				char *s = r_codemeta_print_json (code);
+				std::string decompiled = s ? s : "";
+				free (s);
+				if (decompiled.size () < 2 || decompiled.front () != '{' || decompiled.back () != '}') {
+					throw LowlevelError ("Unexpected r_codemeta_print_json output");
+				}
+				decompiled = decompiled.substr (1, decompiled.size () - 2);
+				r_cons_printf (core->cons, "{%s,%s}\n", decompiled.c_str (), out_stream.str ().c_str ());
+			}
+			break;
 		case DecompileMode::XML:
 			out_stream << "</code></result>";
 			// fallthrough
@@ -727,11 +774,12 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
 		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG
-		    || mode == DecompileMode::SIGNATURE || mode == DecompileMode::STRUCTURE) {
-			// FIELDS (pdgf), CFG (pdgc), SIGNATURE (pdgv), and STRUCTURE (pdgt)
-			// have no RCodeMeta/text output to fall back on -- without this, a
-			// decompile failure produces empty stdout, indistinguishable
-			// from "decompiled fine, zero results."
+		    || mode == DecompileMode::SIGNATURE || mode == DecompileMode::STRUCTURE
+		    || mode == DecompileMode::HARVEST) {
+			// FIELDS (pdgf), CFG (pdgc), SIGNATURE (pdgv), STRUCTURE (pdgt) and
+			// HARVEST (pdgh) have no RCodeMeta/text output to fall back on --
+			// without this, a decompile failure produces empty stdout,
+			// indistinguishable from "decompiled fine, zero results."
 			PJ *pj = pj_new ();
 			if (pj) {
 				pj_o (pj);
@@ -964,6 +1012,9 @@ static void runcmd(RCore *core, const char *input) {
 		break;
 	case 'v': // "pdgv"
 		DecompileCmd (core, DecompileMode::SIGNATURE);
+		break;
+	case 'h': // "pdgh"
+		DecompileCmd (core, DecompileMode::HARVEST);
 		break;
 	case 'o': // "pdgo"
 		DecompileCmd (core, DecompileMode::OFFSET);
