@@ -28,7 +28,7 @@ To build and install r2ghidra you need the following software installed in your 
 * pkg-config - that's how build system find libraries and include files to compile stuff
 * acr/make or meson/ninja - pick the build system you like! all of them are maintained and working
 * msvc/g++/clang++ - basically a C++ compiler (and a C compiler)
-* git/patch - needed to clone ghidra-native and build stuff
+* git/python3 - needed to clone and prepare ghidra-native
 
 If the build fails, please carefully read the error message and act accordingly, r2pm should
 handle the `PKG_CONFIG_PATH` automatically for you in any case.
@@ -60,17 +60,139 @@ Usage: pdg  # Native Ghidra decompiler plugin
 | pdgs          # Display loaded Sleigh Languages
 | pdgsd N       # Disassemble N instructions with Sleigh and print pcode
 | pdgss         # Display automatically matched Sleigh Language ID
+| pdgt          # Dump Ghidra's structured control-flow tree
+| pdgtj         # Dump Ghidra's structured control-flow tree as JSON
+| pdgw          # Write recovered variable types, names and signatures to r2
 | pdgx          # Dump the XML of the current decompiled function
 ```
+
+`pdgt` is the Ghidra equivalent of `pdct`: it prints the recovered control-flow
+hierarchy directly from `Funcdata::getStructure()`, using Ghidra's native tree
+printer. Nodes describe sequences, conditionals, loops, switches and gotos;
+leaves describe basic blocks. This is a control-flow tree, not a C expression
+AST or the p-code graph exported in the `<ast>` section of `pdgx`.
+
+`pdgtj` exports the same hierarchy as a JSON object. Each node has a `type`
+(Ghidra's native block type name), an `index` (Ghidra's block index) and an
+ordered `children` array. Basic-block leaves also have `space`, `start` and
+`stop` address fields, with the numeric bounds reported by Ghidra (the stop is
+the last instruction address, not the byte after the block).
+Block-copy wrappers are resolved to their underlying basic blocks, as in the
+text output. Indices can repeat across nesting levels; they are not unique
+tree-node IDs. Errors use an `errors` array, like `pdgj`. Trees exceeding the
+JSON writer's nesting limit return an error; `pdgt` can still print them.
+
+```
+af
+pdgt
+pdgtj > function-tree.json
+```
+
+With radare2 ABI 163 or newer, `pdg` inlines analyzed callees whose `inline`
+attribute is set when `r2ghidra.inline` is enabled (the default):
+
+```
+afia+ inline @ child
+pdg @ caller
+```
+
+Disable inlining with `e r2ghidra.inline=false`, or clear the mark with
+`afia- inline @ child`. The callee's machine code must be
+available in radare2's IO maps, including for external functions. This uses
+Ghidra's native inliner for argument passing and control flow.
+
+`pdgx` includes the native p-code operation's `is_dead` boolean on its
+`<seqnum>` element, after the existing `space`, `offset` and `uniq` identity
+attributes. The value comes from `PcodeOp::isDead()` for that exact operation;
+it is not a reachability, path-feasibility or runtime-execution claim. The
+function AST contains operations retained in native basic blocks, not an
+inventory of all operations eliminated during decompilation. Older exports
+without this attribute leave the state unknown. Existing operation children,
+varnode references and sequence identities are preserved.
+
+`pdgj` also includes a `pcode_ops` array alongside the existing `code` and
+`annotations`. Each entry contains the operation's `space`, `offset`, `uniq`,
+`opcode` number and native `is_dead` boolean. Operations are the same retained
+basic-block operations exported by `pdgx`, so their dead state is normally
+`false`. Plain `pdg` displays decompiled C without p-code state labels.
+
+`r2ghidra.deadcode` defaults to `false`, so Ghidra eliminates unused computations.
+Set `e r2ghidra.deadcode=true` before `pdg`, `pdgj` or
+`pdgx` to retain unused computations in the decompiled C and p-code exports.
+For example, an assignment overwritten before its value is used can remain
+visible. The output can include extra temporaries, register flags and stack
+bookkeeping. Other simplifications and unreachable-block removal still run;
+this is not an unoptimized instruction listing. Retained operations remain
+internally alive, so their native `is_dead` flag is still `false`, even when
+their computed values are unused.
+
+The same option also exports removed-operation metadata in JSON and XML:
+
+```
+e r2ghidra.deadcode=true
+pdg
+pdgj~{eliminated_ops}
+pdgx~is_dead="true"
+```
+
+`pdgj` adds an `eliminated_ops` array; `pdgx` adds an `<eliminated_ops>` section
+beside `<function>` and `<code>`. With this option enabled, JSON/XML decompilation
+runs analysis twice: first with normal elimination to capture native
+`isDead()==true` records, then with unused computations preserved for display.
+The same operation identity can therefore appear as live in `pcode_ops` and
+removed in `eliminated_ops`: the two sections describe different analysis
+passes. For `mov eax,1; mov eax,42; ret`, the C retains the first assignment and
+`eliminated_ops` records its removal by normal elimination.
+
+Removed-operation records cover operations captured after initial lifting;
+their opcode is the opcode at capture time. They contain identity and state
+metadata without references to deleted operands. Rewrites and moves can also
+retire operations, so these records do not prove that an instruction is
+unreachable or never executes. Operations created and removed later in analysis
+are not included. On an analysis restart the capture is replaced with the new
+pass. With `deadcode=false`, the extra analysis and metadata export are disabled.
+
+These records are not an instruction patch list. One machine instruction can
+produce several p-code operations, and rewrites can move its behavior into
+replacement operations. Instruction removal requires separate analysis of all
+its effects; even retiring every captured operation is not sufficient proof
+that the instruction can be replaced with NOPs.
+
+`pdgw` updates existing variables and the current function's signature. Unknown
+1-, 2-, 4- and 8-byte scalar types are written as fixed-width unsigned integers;
+this preserves their size without claiming that signedness was recovered. A
+signature is written only when all exported types keep the recovered ABI storage;
+individually safe argument types can still be written. Local arrays retain their
+element types and dimensions without treating array bounds as proof that adjacent
+stack writes are unobservable. Existing named composite types are preserved.
+Unsupported types are skipped, and a second write reports no changes once the
+recovered types have converged. Use
+`r2ghidra.write.vars` and `r2ghidra.write.sig` to control the two kinds of writes.
+
+With `e asm.arch=r2ghidra`, `asm.cpu` accepts r2 aliases such as `arm`, `ppc`,
+`java`, `msp430`, and `sh`. Aliases and short Ghidra processor names are
+case-insensitive: `ArM` still selects ARM or AArch64 according to `asm.bits`.
+Full Sleigh IDs, such as `AARCH64:LE:64:v8A`, use the exact spelling listed by
+`pdgs` and override automatic selection. `pdgss` prints the selected ID.
+Aliases still require the corresponding Sleigh files to be installed; for
+example, `sh` needs the optional `SuperH4` processor, not the bundled `SuperH`.
+
+The plugin leaves `cpus` unset because r2 treats a nonempty list as a strict
+allowlist, which would reject languages added through `r2ghidra.sleighhome`.
+Consequently, `e asm.cpu=?` and its CPU-name completion list are empty; use
+`pdgs` to list installed languages. This does not remove the r2 aliases.
 
 The following config vars (for the `e` command) can be used to adjust r2ghidra's behavior:
 
 ```
 [0x000275a7]> e?r2ghidra.
       r2ghidra.casts: Show type casts where needed
+      r2ghidra.ccode: Emit clean C identifiers (bare import names, no fcn./sub. prefixes)
     r2ghidra.cmt.cpp: C++ comment style
  r2ghidra.cmt.indent: Comment indent
+   r2ghidra.deadcode: Include unused code and removed p-code metadata
      r2ghidra.indent: Indent increment
+     r2ghidra.inline: Inline functions marked with the inline attribute
        r2ghidra.lang: Custom Sleigh ID to override auto-detection (e.g. x86:LE:32:default)
     r2ghidra.linelen: Max line length
  r2ghidra.maximplref: Maximum number of references to an expression before showing an explicit variable.
@@ -96,10 +218,16 @@ First, make sure you have the latest version of radare2 for Windows, which can b
 Then run the following command from the radare2/bin/ directory to find out the `R2_USER_PLUGINS` path:
 
 ```
-$ r2 -hh
+$ r2 -H R2_USER_PLUGINS
 ```
 
 Now, download the [latest r2ghidra release](https://github.com/radareorg/r2ghidra/releases) for Windows and copy the dll file in the `R2_USER_PLUGINS` directory.
+
+Also download the matching `r2ghidra_sleigh-<version>.zip` and extract its files into
+`R2_USER_PLUGINS\r2ghidra_sleigh` (the `.ldefs` files must be directly inside that directory).
+The plugin finds this directory automatically, then checks `dir.plugins\r2ghidra_sleigh`
+for a system installation. `SLEIGHHOME` and `e r2ghidra.sleighhome=...` remain available
+for custom locations.
 
 You should now be able to do `pdg` while in radare2 to invoke the r2ghidra decompile command.
 
@@ -117,6 +245,11 @@ $ ./configure --prefix=$(r2 -H R2_PREFIX)
 $ make
 $ make install  # or make user-install
 ```
+`make` checks the pinned subproject revisions automatically. Existing
+ghidra-native checkouts are updated in place; before switching versions,
+patched sources and local changes are saved in a named Git stash inside
+`subprojects/ghidra-native`. A matching checkout can be reused offline.
+
 At the moment there is no way to select which processors to support, so it builds them all and takes a lot of time to compile the sleighfiles.
 
 ### Meson/Ninja
@@ -128,6 +261,9 @@ meson setup b
 meson compile -C b
 meson install -C b
 ```
+
+To update an existing ghidra-native checkout after the dependency pin changes,
+run `make -C subprojects ghidra-native` before reconfiguring Meson.
 
 ### Windows
 
@@ -154,7 +290,5 @@ under its own license:
 * [ghidra-native](https://github.com/radareorg/ghidra-native) — Apache
   License 2.0 (statically linked; this is the native portion of the
   Ghidra decompiler that r2ghidra is built around).
-* [pugixml](https://pugixml.org/) — MIT License (vendored under
-  `subprojects/pugixml`).
 * [zlib](https://zlib.net/) — zlib License (vendored under
   `subprojects/zlib`).

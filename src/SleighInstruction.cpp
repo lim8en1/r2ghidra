@@ -19,11 +19,6 @@ SleighInstructionPrototype *R2Sleigh::getPrototype(SleighInstruction *context) {
 	return new_proto;
 }
 
-void R2Sleigh::reset(LoadImage *ld,ContextDatabase *c_db) {
-	R2loader = ld;
-	Sleigh::reset(ld, c_db);
-}
-
 SleighInstruction *R2Sleigh::getInstruction(Address &addr) {
 	SleighInstruction *inst = nullptr;
 #if 1
@@ -85,7 +80,7 @@ SleighParserContext *R2Sleigh::getParserContext(Address &addr, SleighInstruction
 SleighParserContext *R2Sleigh::newSleighParserContext(Address &addr, SleighInstructionPrototype *proto)
 {
 	SleighParserContext *pos = new SleighParserContext(getContextCache(), this);
-	pos->initialize(1, 0, getConstantSpace());
+	pos->initialize(getConstantSpace(), 1);
 	pos->setAddr(addr);
 	pos->setPrototype(proto);
 	// resolve(*pos); // Resolve ALL the constructors involved in the instruction at this address
@@ -219,7 +214,7 @@ FlowType SleighInstructionPrototype::convertFlowFlags(FlowFlags flags) {
 	flags = FlowFlags(flags & (~(FLOW_CROSSBUILD | FLOW_LABEL)));
 	// NOTE: If prototype has cross-build, flow must be determined dynamically
 	// Convert flags to a standard flowtype
-	switch (flags) {
+	switch ((int)flags) {
 	case 0:
 	case FLOW_BRANCH_TO_END: return FlowType::FALL_THROUGH;
 	case FLOW_CALL: return FlowType::UNCONDITIONAL_CALL;
@@ -419,7 +414,7 @@ SleighInstructionPrototype::FlowFlags SleighInstructionPrototype::gatherFlags(Fl
 	std::vector<FlowRecord *> curlist;
 	if (secnum < 0) {
 		curlist = flowStateList;
-	} else if ((!flowStateListNamed.empty()) && (secnum < flowStateListNamed.size())) {
+	} else if ((!flowStateListNamed.empty()) && ((size_t)secnum < flowStateListNamed.size())) {
 		curlist = flowStateListNamed[secnum];
 	}
 	if (curlist.empty()) {
@@ -456,7 +451,7 @@ void SleighInstructionPrototype::gatherFlows(std::vector<Address> &res, SleighIn
 	std::vector<FlowRecord *> curlist;
 	if (secnum < 0) {
 		curlist = flowStateList;
-	} else if ((!flowStateListNamed.empty()) && (secnum < flowStateListNamed.size())) {
+	} else if ((!flowStateListNamed.empty()) && ((size_t)secnum < flowStateListNamed.size())) {
 		curlist = flowStateListNamed[secnum];
 	}
 	if (curlist.empty()) {

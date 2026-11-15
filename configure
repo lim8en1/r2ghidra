@@ -18,7 +18,6 @@ control_c() {
   exit 1
 }
 trap control_c 2
-USE_RXML=0
 split_host() {
 S="$"
 while : ; do
@@ -127,12 +126,12 @@ done
 : ${INSTALL_PROGRAM_STRIP:=${INSTALL} -m 755 -s}
 : ${INSTALL_MAN:=${INSTALL} -m 444}
 : ${INSTALL_LIB:=${INSTALL} -m 755 -c}
- PKGNAME='r2ghidra' ; VERSION='6.1.8' ; VERSION_MAJOR=6; VERSION_MINOR=1; VERSION_PATCH=8; VERSION_NUMBER=60108; CONTACT_MAIL="pancake@nopcode.org" ; CONTACT_NAME="pancake" ; CONTACT="pancake <pancake@nopcode.org>" ;
+ PKGNAME='r2ghidra' ; VERSION='6.2.6' ; VERSION_MAJOR=6; VERSION_MINOR=2; VERSION_PATCH=6; VERSION_NUMBER=60206; CONTACT_MAIL="pancake@nopcode.org" ; CONTACT_NAME="pancake" ; CONTACT="pancake <pancake@nopcode.org>" ;
 }
 
 show_usage() {
 cat <<EOF2
-'configure' configures r2ghidra-6.1.8 to adapt to many kinds of systems.
+'configure' configures r2ghidra-6.2.6 to adapt to many kinds of systems.
 
 Usage: ./configure [OPTION]... [VAR=VALUE]...
 
@@ -175,10 +174,6 @@ System types:
 EOF2
 
 printf "
-Optional Features:
-  --with-rxml            use r2 apis instead of pugixml
-"
-printf "
 Some influential environment variables:
   CXX         C++ compiler command
   CXXFLAGS    C++ compiler flags
@@ -208,10 +203,10 @@ ocho() {
 
 show_version() {
 if [ "$QUIET" = 1 ]; then
-	echo "6.1.8"
+	echo "6.2.6"
 	exit 0
 fi
-echo "r2ghidra-6.1.8 configuration script done with acr v2.2.8.
+echo "r2ghidra-6.2.6 configuration script done with acr v2.2.8.
 The 'Free Software Foundation' message is only for autodetection.
 Originally written by pancake <nopcode.org>."
 exit 0
@@ -240,12 +235,11 @@ case $flag in
 	show_version ; ;;
 -r|--r|--report)
 echo "PKGNAME:     r2ghidra"
-echo "VERSION:     6.1.8"
+echo "VERSION:     6.2.6"
 echo "AUTHOR:      pancake"
 echo "EMAIL:       pancake@nopcode.org"
 echo "LANGS:       c++"
 echo "PKGCONFIG:   r_core r_asm r_anal"
-echo "FLAGS:       --with-rxml"
 	exit 0
 	;;
 --cache-file)
@@ -297,7 +291,6 @@ echo "FLAGS:       --with-rxml"
 --mandir)
 	MANDIR="$value"; ;;
 
-"--with-rxml") USE_RXML="1"; ;;
 *) if [ "$value" ]; then eval "`echo $flag2=$value`" ;
 else echo ; echo "WARNING: Unknown flag '$flag'." >&2 ; echo ; fi ;;
 esac
@@ -315,7 +308,7 @@ parse_options "$1"
 shift
 done
 
-ENVWORDS="MANDIR DESCRIPTION INFODIR LIBDIR INCLUDEDIR LOCALSTATEDIR ETCDIR SYSCONFDIR DATADIR DOCDIR LIBEXECDIR SBINDIR BINDIR EPREFIX PREFIX SPREFIX TARGET HOST BUILD INSTALL INSTALL_LIB INSTALL_MAN INSTALL_PROGRAM INSTALL_PROGRAM_STRIP INSTALL_DIR INSTALL_SCRIPT INSTALL_DATA HOST_OS HOST_CPU BUILD_OS BUILD_CPU TARGET_OS TARGET_CPU VERSION VERSION_MAJOR VERSION_MINOR VERSION_PATCH VERSION_NUMBER PKGCFG_LIBDIR PKGCFG_INCDIR PKGNAME VPATH CONTACT CONTACT_NAME CONTACT_MAIL CXX CXXFLAGS LDFLAGS HAVE_LANG_CXX CPP HAVE_GIT GIT PKGCONFIG R2_CFLAGS R2_LDFLAGS HAVE_PKGCFG_R_CORE R2ASM_CFLAGS R2ASM_LDFLAGS HAVE_PKGCFG_R_ASM R2ANAL_CFLAGS R2ANAL_LDFLAGS HAVE_PKGCFG_R_ANAL HAVE_R2 R2 USE_RXML R2_PREFIX R2_USER_PLUGINS R2_LIBR_PLUGINS R2GHIDRA_VERSION"
+ENVWORDS="MANDIR DESCRIPTION INFODIR LIBDIR INCLUDEDIR LOCALSTATEDIR ETCDIR SYSCONFDIR DATADIR DOCDIR LIBEXECDIR SBINDIR BINDIR EPREFIX PREFIX SPREFIX TARGET HOST BUILD INSTALL INSTALL_LIB INSTALL_MAN INSTALL_PROGRAM INSTALL_PROGRAM_STRIP INSTALL_DIR INSTALL_SCRIPT INSTALL_DATA HOST_OS HOST_CPU BUILD_OS BUILD_CPU TARGET_OS TARGET_CPU VERSION VERSION_MAJOR VERSION_MINOR VERSION_PATCH VERSION_NUMBER PKGCFG_LIBDIR PKGCFG_INCDIR PKGNAME VPATH CONTACT CONTACT_NAME CONTACT_MAIL CXX CXXFLAGS LDFLAGS HAVE_LANG_CXX CPP HAVE_GIT GIT PKGCONFIG R2_CFLAGS R2_LDFLAGS HAVE_PKGCFG_R_CORE R2ASM_CFLAGS R2ASM_LDFLAGS HAVE_PKGCFG_R_ASM R2ANAL_CFLAGS R2ANAL_LDFLAGS HAVE_PKGCFG_R_ANAL HAVE_R2 R2 R2_PREFIX R2_USER_PLUGINS R2_LIBR_PLUGINS R2GHIDRA_VERSION"
 
 create_environ
 
@@ -566,7 +559,7 @@ do_remove
 if [ "$QUIET" = 0 ]; then
 echo
 echo "Final report:"
-for A in  USE_RXML VERSION R2_PREFIX PREFIX PKGCONFIG ; do
+for A in  VERSION R2_PREFIX PREFIX PKGCONFIG ; do
 eval VAL="\$${A}"
 [ -z "${VAL}" ] && VAL="\"\""
 echo " - ${A} = ${VAL}"
