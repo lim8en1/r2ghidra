@@ -3,7 +3,7 @@
 
 #include "R2Architecture.h"
 #include "CodeXMLParse.h"
-#include "PrettyXmlEncode.h"
+#include "PcodeXmlEncode.h"
 #include "R2PrintC.h"
 #include "SleighAsm.h"
 #include "ArchMap.h"
@@ -22,12 +22,14 @@
 
 #include <libdecomp.hh>
 
-#if R2__UNIX__
+#if R2__UNIX__ && !defined(__wasi__)
 #include <errno.h>
+#include <poll.h>
 #include <sys/wait.h>
 #endif
 
 #include <vector>
+#include <map>
 #include <mutex>
 
 #undef DEBUG_EXCEPTIONS
@@ -83,16 +85,32 @@ CV cfg_var_maximplref ("maximplref",  "2",        "Maximum number of references 
 CV cfg_var_rawptr     ("rawptr",      "true",     "Show unknown globals as raw addresses instead of variables");
 CV cfg_var_verbose    ("verbose",     "false",    "Show verbose warning messages while decompiling");
 CV cfg_var_casts      ("casts",       "false",    "Show type casts where needed");
+CV cfg_var_ccode      ("ccode",       "false",    "Emit clean C identifiers (bare import names, no fcn./sub. prefixes)");
+CV cfg_var_deadcode   ("deadcode",    "false",    "Include unused code and removed p-code metadata");
 CV cfg_var_fixups     ("fixups",      "false",    "Apply pcode fixups");
+CV cfg_var_inline     ("inline",      "true",     "Inline functions marked with the inline attribute");
 CV cfg_var_varargs    ("varargs",     "false",    "Recover printf-family varargs from literal format strings");
-CV cfg_var_roprop     ("roprop",      "0",        "Propagate read-only constants (0,1,2,3,4)");
+CV cfg_var_vaformats  ("varargs.formats", "",     "Extra printf-style formatters for vararg recovery (bare names, comma separated)");
+CV cfg_var_roprop     ("roprop",      "0",        "Propagate read-only constants (0=off,1=symbols only,2=pointer scan,3=read-only maps,4=force)");
 CV cfg_var_timeout    ("timeout",     "0",        "Run decompilation in a separate process and kill it after a specific time");
 CV cfg_var_compiler   ("compiler",    "default",  "Select compiler for calling conventions", ConfigCompiler);
 CV cfg_var_write_vars ("write.vars",  "true",     "pdgw: write recovered variable names and types");
 CV cfg_var_write_sig  ("write.sig",   "true",     "pdgw: write the recovered function signature");
 
 
-static std::recursive_mutex decompiler_mutex;
+#ifdef __wasi__
+// wasi is single-threaded and its libc++ ships without std::recursive_mutex
+struct R2GNullMutex {
+	void lock() {}
+	void unlock() {}
+	bool try_lock() { return true; }
+};
+typedef R2GNullMutex R2GMutex;
+#else
+typedef std::recursive_mutex R2GMutex;
+#endif
+
+static R2GMutex decompiler_mutex;
 
 class DecompilerLock {
 private:
@@ -127,7 +145,9 @@ static const char* r2ghidra_help[] = {
 	"pd:gs", "", "# Display loaded Sleigh Languages (alias for pdgL)",
 	"pd:gsd", " N", "# Disassemble N instructions with Sleigh and print pcode",
 	"pd:gss", "", "# Display automatically matched Sleigh Language ID",
-	"pd:gt", " [var]", "# Recover a struct from var's access pattern and apply it to var",
+	"pd:gS", " [var]", "# Recover a struct from var's access pattern and apply it to var",
+	"pd:gt", "", "# Dump Ghidra's structured control-flow tree",
+	"pd:gtj", "", "# Dump Ghidra's structured control-flow tree as JSON",
 	"pd:gw", "", "# Decompile and write recovered names, types and signature back into r2",
 	"pd:gx", "", "# Dump the XML of the current decompiled function",
 	"Environment:", "", "",
@@ -150,6 +170,8 @@ enum class DecompileMode {
 	STATEMENTS,
 	DISASM,
 	JSON,
+	TREE,
+	TREE_JSON,
 	WRITE,
 	FIELDS,
 	CFG,
@@ -189,7 +211,7 @@ static void HarvestFieldAccesses(Funcdata *func, std::stringstream &out) {
 		out << "}";
 	};
 
-	for (auto iter = func->beginOpAll (); iter != func->endOpAll (); ++iter) {
+	for (auto iter = func->beginOpMain (); iter != func->endOpMain (); ++iter) {
 		PcodeOp *op = iter->second;
 		OpCode oc = op->code ();
 
@@ -474,10 +496,166 @@ static void seedGlobalPointerRegister(R2Architecture &arch, RCore *core, RAnalFu
 	}
 	AddrSpace *space = arch.getDefaultCodeSpace ();
 	ContextDatabase *cdb = arch.getContextDatabase ();
-	r_list_foreach_cpp<RAnalBlock> (function->bbs, [&](RAnalBlock *bb) {
+	r_anal_function_bbs_foreach_cpp (function, [&](RAnalBlock *bb) {
 		TrackedSet &tset = cdb->createSet (Address (space, bb->addr), Address (space, bb->addr + bb->size));
 		tset.push_back ({ reg, value });
 	});
+}
+
+struct PcodeSnapshot {
+	struct Operation {
+		// The native bank keeps retired operations allocated until analysis is cleared.
+		const PcodeOp *native;
+		OpCode opcode;
+		bool dead = false;
+
+		bool isDead() const { return dead; }
+	};
+	std::map<SeqNum, Operation> operations;
+
+	void capture(const Funcdata &func) {
+		operations.clear ();
+		for (auto it = func.beginOpAlive (); it != func.endOpAlive (); ++it) {
+			const PcodeOp *op = *it;
+			operations.emplace (op->getSeqNum (), Operation { op, op->code () });
+		}
+	}
+
+	void finish() {
+		for (auto &[sequence, operation] : operations) {
+			operation.dead = operation.native->isDead ();
+			operation.native = nullptr;
+		}
+	}
+
+	const Operation *findOp(const SeqNum &sequence) const {
+		auto it = operations.find (sequence);
+		return it == operations.end () ? nullptr : &it->second;
+	}
+};
+
+static int PerformWithSnapshot(Action &action, Funcdata &func, PcodeSnapshot *snapshot) {
+	action.reset (func);
+	if (!snapshot) {
+		return action.perform (func);
+	}
+	Action *start = action.getSubAction ("start");
+	Action *lifted = action.getSubAction ("constbase");
+	if (!start || !lifted) {
+		throw LowlevelError ("P-code capture checkpoints are unavailable");
+	}
+	start->setBreakPoint (Action::break_start, start->getName ());
+	lifted->setBreakPoint (Action::break_start, lifted->getName ());
+	int res;
+	while ((res = action.perform (func)) < 0) {
+		if (start->getStatus () == Action::status_breakstarthit) {
+			// A restart frees retired ops. Discard pointers before inspecting the new analysis.
+			snapshot->operations.clear ();
+		} else if (lifted->getStatus () == Action::status_breakstarthit) {
+			snapshot->capture (func);
+		} else {
+			break;
+		}
+	}
+	start->clearBreakPoints ();
+	lifted->clearBreakPoints ();
+	snapshot->finish ();
+	return res;
+}
+
+static void PrintPcodeOpJSON(PJ *pj, const SeqNum &sequence, OpCode opcode, bool isDead) {
+	pj_o (pj);
+	pj_ks (pj, "space", sequence.getAddr ().getSpace ()->getName ().c_str ());
+	pj_kn (pj, "offset", sequence.getAddr ().getOffset ());
+	pj_kn (pj, "uniq", sequence.getTime ());
+	pj_ki (pj, "opcode", opcode);
+	pj_kb (pj, "is_dead", isDead);
+	pj_end (pj);
+}
+
+static void PrintEliminatedXML(std::ostream &stream, const PcodeSnapshot &snapshot) {
+	stream << "<eliminated_ops>";
+	PcodeXmlEncode encoder (stream, snapshot);
+	for (const auto &[sequence, operation] : snapshot.operations) {
+		if (operation.isDead ()) {
+			encoder.openElement (ELEM_OP);
+			encoder.writeSignedInteger (ATTRIB_CODE, operation.opcode);
+			sequence.encode (encoder);
+			encoder.closeElement (ELEM_OP);
+		}
+	}
+	stream << "</eliminated_ops>";
+}
+
+static void PrintCodeJSON(const Funcdata &func, RCodeMeta *code, std::ostream &stream, const PcodeSnapshot *snapshot) {
+	PJ *pj = pj_new ();
+	if (!pj) {
+		throw LowlevelError ("Failed to allocate p-code JSON");
+	}
+	pj_o (pj);
+	pj_ka (pj, "pcode_ops");
+	const BlockGraph &blocks = func.getBasicBlocks ();
+	for (int4 i = 0; i < blocks.getSize (); i++) {
+		const auto *block = static_cast<const BlockBasic *>(blocks.getBlock (i));
+		for (auto it = block->beginOp (); it != block->endOp (); ++it) {
+			const PcodeOp *op = *it;
+			PrintPcodeOpJSON (pj, op->getSeqNum (), op->code (), op->isDead ());
+		}
+	}
+	pj_end (pj);
+	if (snapshot) {
+		pj_ka (pj, "eliminated_ops");
+		for (const auto &[sequence, operation] : snapshot->operations) {
+			if (operation.isDead ()) {
+				PrintPcodeOpJSON (pj, sequence, operation.opcode, operation.isDead ());
+			}
+		}
+		pj_end (pj);
+	}
+	pj_end (pj);
+	char *json = r_codemeta_print_json (code);
+	if (!json) {
+		pj_free (pj);
+		throw LowlevelError ("Failed to encode decompiled code as JSON");
+	}
+	// Extend the existing JSON object without changing its code or annotations.
+	stream.write (json, strlen (json) - 1);
+	stream << ',' << (pj_string (pj) + 1);
+	free (json);
+	pj_free (pj);
+}
+
+static bool PrintStructureJSON(PJ *pj, const FlowBlock &block) {
+	// Match BlockCopy::printTree: expose the underlying basic block as a leaf.
+	if (block.getType () == FlowBlock::t_copy) {
+		return PrintStructureJSON (pj, *block.subBlock (0));
+	}
+	if (!pj_o (pj)) {
+		return false;
+	}
+	pj_ks (pj, "type", FlowBlock::typeToName (block.getType ()).c_str ());
+	pj_ki (pj, "index", block.getIndex ());
+	const Address start = block.getStart ();
+	const Address stop = block.getStop ();
+	if (!start.isInvalid () && !stop.isInvalid ()) {
+		pj_ks (pj, "space", start.getSpace ()->getName ().c_str ());
+		pj_kn (pj, "start", start.getOffset ());
+		pj_kn (pj, "stop", stop.getOffset ());
+	}
+	pj_k (pj, "children");
+	if (!pj_a (pj)) {
+		return false;
+	}
+	if (const auto *graph = dynamic_cast<const BlockGraph *> (&block)) {
+		for (const FlowBlock *child : graph->getList ()) {
+			if (!PrintStructureJSON (pj, *child)) {
+				return false;
+			}
+		}
+	}
+	pj_end (pj);
+	pj_end (pj);
+	return true;
 }
 
 static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RCodeMeta **out_code, Harvest *out_harvest = nullptr, const char *fillVarName = nullptr) {
@@ -489,7 +667,8 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	DocumentStorage store = DocumentStorage ();
 	arch.max_implied_ref = cfg_var_maximplref.GetInt (core->config);
 	arch.readonlypropagate = cfg_var_roprop.GetBool (core->config);
-	arch.setRawPtr (cfg_var_rawptr.GetBool (core->config));
+	// ccode (clean C output) disables raw pointer globals so unknowns become named symbols
+	arch.setRawPtr (cfg_var_rawptr.GetBool (core->config) && !cfg_var_ccode.GetBool (core->config));
 	arch.init (store);
 
 	auto faddr = Address(arch.getDefaultCodeSpace (), function->addr);
@@ -499,11 +678,26 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	auto r2c = dynamic_cast<R2PrintC *>(arch.print);
 	bool showCasts = cfg_var_casts.GetBool (core->config);
 	r2c->setOptionNoCasts (!showCasts);
+	if (cfg_var_ccode.GetBool (core->config)) {
+		// CCODE-style output: hide implied ZEXT/SEXT extensions and drop the
+		// calling convention from prototypes — closer to what Ghidra's toggleCCode
+		// emits and closer to plain standard C. Casts stay under the r2ghidra.casts
+		// option: forcing them off here would silently drop necessary truncations
+		// even when the user explicitly asked for them.
+		auto cc = dynamic_cast<PrintC *>(arch.print);
+		cc->setHideImpliedExts (true);
+		cc->setConvention (false);
+	}
 	ApplyPrintCConfig (core->config, dynamic_cast<PrintC *>(arch.print));
 	if (func == nullptr) {
 		throw LowlevelError ("No function in Scope");
 	}
 	seedGlobalPointerRegister (arch, core, function);
+	const bool showDeadcode = cfg_var_deadcode.GetBool (core->config);
+	const bool exportDeadcode = showDeadcode && (mode == DecompileMode::JSON || mode == DecompileMode::XML);
+	if (showDeadcode && !exportDeadcode) {
+		arch.allacts.toggleAction (arch.allacts.getCurrentName (), "deadcode", false);
+	}
 	arch.getCore()->sleepBegin ();
 	auto action = arch.allacts.getCurrent ();
 
@@ -512,16 +706,26 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	}
 	PcodeFixupPreprocessor::fixupNoreturnCallsBeforeData(function, func, core, arch);
 	PcodeFixupPreprocessor::fixupResolvedIndirectCalls(function, func, core, arch);
+	if (cfg_var_ccode.GetBool (core->config)) {
+		PcodeFixupPreprocessor::fixupImportCallDeindirection(function, func, core, arch);
+	}
 	if (cfg_var_varargs.GetBool (core->config)) {
 		PcodeFixupPreprocessor::fixupVariadicFormatCalls(function, func, core, arch);
 	}
 
+	PcodeSnapshot snapshot;
+	PcodeSnapshot *capture = exportDeadcode ? &snapshot : nullptr;
 	int res;
 #ifndef DEBUG_EXCEPTIONS
 	try {
 #endif
-		action->reset (*func);
-		res = action->perform (*func);
+		res = PerformWithSnapshot (*action, *func, capture);
+		if (capture && res >= 0) {
+			// Save normal elimination results before rendering the version that preserves unused code.
+			arch.clearAnalysis (func);
+			action = arch.allacts.toggleAction (arch.allacts.getCurrentName (), "deadcode", false);
+			res = PerformWithSnapshot (*action, *func, nullptr);
+		}
 #ifndef DEBUG_EXCEPTIONS
 	} catch (const LowlevelError &error) {
 		arch.getCore()->sleepEndForce ();
@@ -590,6 +794,26 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 			<< ",\"fields\":" << fields_out.str ();
 		return;
 	}
+	if (mode == DecompileMode::TREE || mode == DecompileMode::TREE_JSON) {
+		if (!func->isProcStarted () || func->hasNoStructBlocks ()) {
+			throw LowlevelError ("Function not fully decompiled. No structure present.");
+		}
+		if (mode == DecompileMode::TREE) {
+			func->getStructure ().printTree (out_stream, 0);
+		} else {
+			PJ *pj = pj_new ();
+			if (!pj) {
+				throw LowlevelError ("Failed to allocate control-flow tree JSON");
+			}
+			if (!PrintStructureJSON (pj, func->getStructure ())) {
+				pj_free (pj);
+				throw LowlevelError ("Control-flow tree exceeds JSON depth limit");
+			}
+			out_stream << pj_string (pj);
+			pj_free (pj);
+		}
+		return;
+	}
 	switch (mode) {
 	case DecompileMode::XML:
 	case DecompileMode::DEFAULT:
@@ -605,12 +829,14 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 	if (mode == DecompileMode::XML) {
 		out_stream << "<result><function>";
 		{
-		//func->encode (out_stream);
-		//PrettyXmlEncode enc(out_stream);
-		XmlEncode enc(out_stream);
-		func->encode(enc, 0, true);
+			PcodeXmlEncode enc(out_stream, *func);
+			func->encode(enc, 0, true, true);
 		}
-		out_stream << "</function><code>";
+		out_stream << "</function>";
+		if (capture) {
+			PrintEliminatedXML (out_stream, *capture);
+		}
+		out_stream << "<code>";
 	}
 	switch (mode) {
 	case DecompileMode::XML:
@@ -626,6 +852,10 @@ static void Decompile(RCore *core, ut64 addr, DecompileMode mode, std::stringstr
 			if (!*out_code) {
 				std::cout << out_stream.str().c_str () << std::endl;
 				throw LowlevelError ("Failed to parse XML code from Decompiler");
+			}
+			if (mode == DecompileMode::JSON) {
+				out_stream.str ("");
+				PrintCodeJSON (*func, *out_code, out_stream, capture);
 			}
 		}
 		break;
@@ -739,12 +969,12 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 				free (s);
 			}
 			break;
+		case DecompileMode::TREE:
+			r_cons_print (core->cons, out_stream.str ().c_str ());
+			break;
+		case DecompileMode::TREE_JSON:
 		case DecompileMode::JSON:
-			{
-				char *s = r_codemeta_print_json (code);
-				r_cons_println (core->cons, s);
-				free (s);
-			}
+			r_cons_println (core->cons, out_stream.str ().c_str ());
 			break;
 		case DecompileMode::HARVEST:
 			{
@@ -773,10 +1003,11 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 #ifndef DEBUG_EXCEPTIONS
 	} catch (const LowlevelError &error) {
 		std::string s = "Ghidra Decompiler Error: " + error.explain;
-		if (mode == DecompileMode::JSON || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG
+		if (mode == DecompileMode::JSON || mode == DecompileMode::TREE_JSON
+		    || mode == DecompileMode::FIELDS || mode == DecompileMode::CFG
 		    || mode == DecompileMode::SIGNATURE || mode == DecompileMode::STRUCTURE
 		    || mode == DecompileMode::HARVEST) {
-			// FIELDS (pdgf), CFG (pdgc), SIGNATURE (pdgv), STRUCTURE (pdgt) and
+			// FIELDS (pdgf), CFG (pdgc), SIGNATURE (pdgv), STRUCTURE (pdgS) and
 			// HARVEST (pdgh) have no RCodeMeta/text output to fall back on --
 			// without this, a decompile failure produces empty stdout,
 			// indistinguishable from "decompiled fine, zero results."
@@ -801,7 +1032,7 @@ static void DecompileCmd (RCore *core, DecompileMode mode) {
 static void DecompileCmdStructure(RCore *core, const char *varName) {
 	DecompilerLock lock(core);
 	if (!varName || !*varName) {
-		R_LOG_ERROR ("pdgt: variable name required, e.g. pdgt param1");
+		R_LOG_ERROR ("pdgS: variable name required, e.g. pdgS param1");
 		return;
 	}
 #ifndef DEBUG_EXCEPTIONS
@@ -831,18 +1062,22 @@ static void DecompileCmdStructure(RCore *core, const char *varName) {
 
 // see sleighexample.cc
 class AssemblyRaw : public AssemblyEmit {
+private:
+	ostream &out;
+
 public:
+	AssemblyRaw(ostream &o): out(o) {}
+
 	void dump(const Address &addr, const string &mnem, const string &body) override {
-		std::stringstream ss;
-		addr.printRaw (ss);
-		ss << ": " << mnem << ' ' << body;
-		r_cons_gprintf ("%s\n", ss.str().c_str ());
+		addr.printRaw (out);
+		out << ": " << mnem << ' ' << body << '\n';
 	}
 };
 
 class PcodeRawOut : public PcodeEmit {
 private:
 	const Translate *trans = nullptr;
+	ostream &out;
 
 	void print_vardata(ostream &s, VarnodeData &data) {
 		AddrSpace *space = data.space;
@@ -875,43 +1110,43 @@ private:
 	}
 
 public:
-	PcodeRawOut(const Translate *t): trans(t) {}
+	PcodeRawOut(const Translate *t, ostream &o): trans(t), out(o) {}
 
 	void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override {
-		std::stringstream ss;
+		out << "    ";
 		bool is_store = (opc == CPUI_STORE && isize == 3);
 		if (outvar) {
-			print_vardata (ss,*outvar);
-			ss << " = ";
+			print_vardata (out,*outvar);
+			out << " = ";
 		}
-		ss << get_opname(opc);
+		out << get_opname(opc);
 		// Possibly check for a code reference or a space reference
-		ss << ' ';
+		out << ' ';
 		int4 print_isize = is_store ? 2 : isize;
 		// For indirect case in SleighBuilder::dump(OpTpl *op)'s "vn->isDynamic(*walker)" branch.
 		if (print_isize > 1 && vars[0].size == sizeof(AddrSpace *) && vars[0].space->getName() == "const"
 				&& (vars[0].offset >> 24) == ((uintb)vars[1].space >> 24) && trans == ((AddrSpace*)vars[0].offset)->getTrans())
 		{
-			ss << ((AddrSpace*)vars[0].offset)->getName();
-			ss << '[';
-			print_vardata (ss, vars[1]);
-			ss << ']';
+			out << ((AddrSpace*)vars[0].offset)->getName();
+			out << '[';
+			print_vardata (out, vars[1]);
+			out << ']';
 			for (int4 i = 2; i < print_isize; i++) {
-				ss << ", ";
-				print_vardata (ss, vars[i]);
+				out << ", ";
+				print_vardata (out, vars[i]);
 			}
 		} else {
-			print_vardata (ss, vars[0]);
+			print_vardata (out, vars[0]);
 			for (int4 i = 1; i < print_isize; i++) {
-				ss << ", ";
-				print_vardata (ss, vars[i]);
+				out << ", ";
+				print_vardata (out, vars[i]);
 			}
 		}
 		if (is_store) {
-			ss << " = ";
-			print_vardata (ss, vars[2]);
+			out << " = ";
+			print_vardata (out, vars[2]);
 		}
-		r_cons_gprintf ("    %s\n", ss.str().c_str ());
+		out << '\n';
 	}
 };
 
@@ -924,8 +1159,9 @@ static void Disassemble(RCore *core, ut64 ops) {
 	arch.init (store);
 
 	const Translate *trans = arch.translate;
-	PcodeRawOut emit (arch.translate);
-	AssemblyRaw assememit;
+	std::stringstream out;
+	PcodeRawOut emit (arch.translate, out);
+	AssemblyRaw assememit (out);
 
 	Address addr (trans->getDefaultCodeSpace(), core->addr);
 	for (ut64 i = 0; i < ops; i++) {
@@ -940,6 +1176,7 @@ static void Disassemble(RCore *core, ut64 ops) {
 			addr = addr + trans->getAlignment();
 		}
 	}
+	r_cons_print (core->cons, out.str ().c_str ());
 }
 
 static void SetInitialSleighHome(RConfig *cfg) {
@@ -1016,6 +1253,15 @@ static void runcmd(RCore *core, const char *input) {
 	case 'h': // "pdgh"
 		DecompileCmd (core, DecompileMode::HARVEST);
 		break;
+	case 't': // "pdgt", "pdgtj"
+		if (!input[1]) {
+			DecompileCmd (core, DecompileMode::TREE);
+		} else if (input[1] == 'j' && !input[2]) {
+			DecompileCmd (core, DecompileMode::TREE_JSON);
+		} else {
+			PrintUsage (core);
+		}
+		break;
 	case 'o': // "pdgo"
 		DecompileCmd (core, DecompileMode::OFFSET);
 		break;
@@ -1029,7 +1275,11 @@ static void runcmd(RCore *core, const char *input) {
 			PrintAutoSleighLang (core);
 			break;
 		case 'd': // "pdgsd"
-			Disassemble (core, r_num_math (core->num, input + 2));
+			try {
+				Disassemble (core, r_num_math (core->num, input + 2));
+			} catch (const LowlevelError &error) {
+				R_LOG_ERROR ("%s", error.explain.c_str ());
+			}
 			break;
 		default:
 			ListSleighLangs (core);
@@ -1042,7 +1292,7 @@ static void runcmd(RCore *core, const char *input) {
 	case 'w': // "pdgw"
 		DecompileCmd (core, DecompileMode::WRITE);
 		break;
-	case 't': // "pdgt"
+	case 'S': // "pdgS"
 		DecompileCmdStructure (core, r_str_trim_head_ro (input + 1));
 		break;
 	case 'p': // "pdgp"
@@ -1056,13 +1306,13 @@ static void runcmd(RCore *core, const char *input) {
 
 static void _cmd(RCore *core, const char *input) {
 	int timeout = r_config_get_i (core->config, "r2ghidra.timeout");
-	if (*input == 'w' || *input == 't') {
-		// pdgw/pdgt write into the r2 DB; a forked child would lose the writes
+	if (*input == 'w' || *input == 'S') {
+		// pdgw/pdgS write into the r2 DB; a forked child would lose the writes
 		runcmd (core, input);
 		return;
 	}
 	if (timeout > 0) {
-#if R2__UNIX__
+#if R2__UNIX__ && !defined(__wasi__)
 		// TODO: note that first execution is slower than the rest. and forking loses the cache
 		int fds[2];
 		if (pipe (fds) != 0) {
@@ -1071,40 +1321,79 @@ static void _cmd(RCore *core, const char *input) {
 		}
 		pid_t pid = r_sys_fork ();
 		if (pid < 0) {
+			close (fds[0]);
+			close (fds[1]);
 			R_LOG_ERROR ("Cannot fork");
 			return;
 		}
 		if (pid == 0) {
 			close (fds[0]);
+			r_cons_reset (core->cons);
 			runcmd (core, input);
-			r_cons_flush (core->cons);
-			fflush (stdout);
-			write (fds[1], "\x12", 1);
-			exit (0);
+			size_t size = 0;
+			const char *buf = r_cons_get_buffer (core->cons, &size);
+			while (size > 0) {
+				ssize_t n = write (fds[1], buf, size);
+				if (n < 0 && errno == EINTR) {
+					continue;
+				}
+				if (n <= 0) {
+					_exit (1);
+				}
+				buf += n;
+				size -= n;
+			}
+			_exit (0);
 		} else {
-			fd_set rfds;
-			struct timeval tv;
+			struct pollfd pfd = { fds[0], POLLIN, 0 };
+			ut64 deadline = r_time_now_mono () + (ut64)timeout * 1000;
+			std::string output;
 			int wstatus = 0;
-			tv.tv_sec = timeout / 1000;
-			tv.tv_usec = (timeout - (tv.tv_sec * 1000)) * 1000;
-			FD_ZERO (&rfds);
-			FD_SET (fds[0], &rfds);
+			bool complete = false;
 			// keeping our copy of the write end open would suppress eof from a crashed child until the timeout expires
 			close (fds[1]);
-			if (select (fds[0] + 1, &rfds, NULL, NULL, &tv) > 0) {
-				char ch = 0;
-				if (read (fds[0], &ch, 1) != 1 || ch != 0x12) {
-					R_LOG_ERROR ("Decompiler process died unexpectedly");
+			while (true) {
+				ut64 now = r_time_now_mono ();
+				int ready = now < deadline? poll (&pfd, 1, (deadline - now + 999) / 1000): 0;
+				if (ready < 0 && errno == EINTR) {
+					continue;
 				}
-			} else {
-				eprintf ("Timeout\n");
-				kill (pid, 9);
+				if (ready <= 0) {
+					if (!ready) {
+						eprintf ("Timeout\n");
+					} else {
+						R_LOG_ERROR ("Cannot poll decompiler output");
+					}
+					break;
+				}
+				char buf[4096];
+				ssize_t n = read (fds[0], buf, sizeof (buf));
+				if (n < 0 && errno == EINTR) {
+					continue;
+				}
+				if (n <= 0) {
+					complete = n == 0;
+					if (!complete) {
+						R_LOG_ERROR ("Cannot read decompiler output");
+					}
+					break;
+				}
+				output.append (buf, n);
 			}
-			while (waitpid (pid, &wstatus, 0) == -1 && errno == EINTR) {
+			if (!complete) {
+				kill (pid, SIGKILL);
 			}
-			fflush (stderr);
-			fflush (stdout);
 			close (fds[0]);
+			pid_t waited;
+			do {
+				waited = waitpid (pid, &wstatus, 0);
+			} while (waited == -1 && errno == EINTR);
+			if (complete && waited == pid && WIFEXITED (wstatus) && WEXITSTATUS (wstatus) == 0) {
+				// Apply filters and redirections in the parent, just like a non-worker command.
+				r_cons_write (core->cons, output.data (), output.size ());
+			} else if (complete) {
+				R_LOG_ERROR ("Decompiler process died unexpectedly");
+			}
 		}
 #else
 		R_LOG_WARN ("r2ghidra.timeout is not supported outside UNIX systems.");
@@ -1139,7 +1428,7 @@ extern "C" bool r2ghidra_core_cmd(RCorePluginSession *cps, const char *input) {
 
 bool ConfigCompiler(void *user, void *data) {
 	RCore *core = (RCore *) user;
-	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
 	auto node = reinterpret_cast<RConfigNode *>(data);
 	if (!strcmp (node->value, "?")) {
 		auto c = findGhidraCompiler (core, node->value);
@@ -1156,7 +1445,7 @@ bool ConfigCompiler(void *user, void *data) {
 }
 
 bool SleighHomeConfig(void */* user */, void *data) {
-	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
 	RConfigNode *node = reinterpret_cast<RConfigNode *>(data);
 	SleighArchitecture::shutdown ();
 	SleighArchitecture::specpaths = FileManage ();
@@ -1169,7 +1458,7 @@ bool SleighHomeConfig(void */* user */, void *data) {
 extern "C" RArchPlugin r_arch_plugin_ghidra;
 
 extern "C" bool r2ghidra_core_init(RCorePluginSession *cps) {
-	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
+	std::lock_guard<R2GMutex> lock(decompiler_mutex);
 	startDecompilerLibrary (nullptr);
 	RCore *core = reinterpret_cast<RCore *>(cps->core);
 	r_arch_plugin_add (core->anal->arch, &r_arch_plugin_ghidra);
@@ -1186,8 +1475,8 @@ extern "C" bool r2ghidra_core_init(RCorePluginSession *cps) {
 	return true;
 }
 
-extern "C" bool r2ghidra_core_fini(RCorePluginSession *cps, const char *cmd) {
-	std::lock_guard<std::recursive_mutex> lock (decompiler_mutex);
+extern "C" bool r2ghidra_core_fini(RCorePluginSession *cps) {
+	std::lock_guard<R2GMutex> lock (decompiler_mutex);
 	shutdownDecompilerLibrary ();
 	return true;
 }

@@ -1,7 +1,7 @@
 name: ci
 
 env:
-  R2V: 6.1.8
+  R2V: 6.2.6
 
 on:
   push:
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   r2git:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -38,8 +38,39 @@ jobs:
 #    - name: Running Testsuite
 #      run: make -C test
 
+  linux-alpine:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+    # Run checkout on the host; build and test against Alpine's musl libc.
+    - name: Building and testing radare2 and r2ghidra on Alpine
+      run: |
+        docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src alpine:3.23 sh -euxc '
+          apk add --no-cache bash build-base ca-certificates coreutils git \
+            linux-headers ncurses-dev openssl-dev patch pkgconf python3
+          git config --global --add safe.directory /src
+          git clone --depth=1 https://github.com/radareorg/radare2 /tmp/radare2
+          cd /tmp/radare2
+          MAKE_JOBS=2 sys/install.sh --install /usr
+          r2 -v
+          cd /src
+          ./preconfigure
+          ./configure --prefix=/usr
+          make -j2
+          make install
+          R2_DEBUG=1 r2 -qc "af;pdg" /bin/ls > /tmp/decompiled.c
+          cat /tmp/decompiled.c
+          grep entry0 /tmp/decompiled.c
+        '
+
   linux-deb:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -54,6 +85,14 @@ jobs:
       run: ./preconfigure && ./configure --prefix=/usr && make -j4 ; make user-install
     - name: Testing r2ghidra oneliner on home setup
       run: R2_DEBUG=1 r2 -qc 'af;pdg' /bin/ls | tee a.txt && grep entry0 a.txt
+    - name: Packaging r2pm binary
+      run: make bindist
+    - name: Uploading r2pm binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: bindist-linux-x86-64
+        path: r2ghidra-*.zip
+        if-no-files-found: error
     - name: System-wide installation
       run: make user-uninstall && sudo make install
     - name: Testing r2ghidra oneliner on system wide install
@@ -77,8 +116,31 @@ jobs:
         name: linux-acr-ok
         path: r2ghidra_sleigh-*.zip
 
+  linux-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: Installing radare2 from deb
+      run: |
+        wget https://github.com/radareorg/radare2/releases/download/${{env.R2V}}/radare2_${{env.R2V}}_arm64.deb
+        wget https://github.com/radareorg/radare2/releases/download/${{env.R2V}}/radare2-dev_${{env.R2V}}_arm64.deb
+        sudo dpkg -i *.deb
+    - name: Building r2ghidra with acr
+      run: ./preconfigure && ./configure --prefix=/usr && make -j4 ; make user-install
+    - name: Testing r2ghidra oneliner on home setup
+      run: R2_DEBUG=1 r2 -qc 'af;pdg' /bin/ls | tee a.txt && grep entry0 a.txt
+    - name: Packaging r2pm binary
+      run: make bindist
+    - name: Uploading r2pm binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: bindist-linux-arm-64
+        path: r2ghidra-*.zip
+        if-no-files-found: error
+
   tarball:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout
       uses: actions/checkout@v7
@@ -101,7 +163,7 @@ jobs:
   linux-asan:
     if: ${{ false }}  # disable for now
     # The type of runner that the job will run on
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
 
@@ -120,7 +182,7 @@ jobs:
         grep entry0 a.txt
 
   linux-meson:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -137,7 +199,7 @@ jobs:
     - name: Installing System's Meson Ninja
       run: sudo pip install ninja meson && sudo ninja --version && sudo meson --version
     - name: Building r2ghidra with meson
-      run: ./preconfigure && meson b && ninja -C b && sudo ninja -C b install
+      run: ./preconfigure && meson setup b && ninja -C b && sudo ninja -C b install
     - name: Cannot test meson builds, because those cant be installed yet
       run: echo nada
 #    - name: Testing r2ghidra oneliner
@@ -149,11 +211,15 @@ jobs:
 
   macos-pkg:
     # The type of runner that the job will run on
-    runs-on: macos-latest
-    # Build for both architectures
+    runs-on: ${{ matrix.os }}
+    # Build each architecture natively
     strategy:
       matrix:
-        arch: [x86_64, arm64]
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-latest
+            arch: arm64
     env:
       ARCH: ${{ matrix.arch }}
 
@@ -185,6 +251,14 @@ jobs:
       run: |
         r2 -qc 'af;pdg' test/bins/rec | tee a.txt
         grep csu_init a.txt
+    - name: Packaging r2pm binary
+      run: make bindist
+    - name: Uploading r2pm binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: bindist-macos-${{ env.ARCH }}
+        path: r2ghidra-*.zip
+        if-no-files-found: error
     - name: Uploading artifacts
       uses: actions/upload-artifact@v7
       with:
@@ -212,6 +286,8 @@ jobs:
         python -m wget https://github.com/radareorg/radare2/releases/download/${{env.R2V}}/radare2-${{env.R2V}}-w64.zip -o r2.zip
         python3 -m zipfile -e r2.zip .
         mv radare2-${{env.R2V}}-w64 radare2
+        # XXX workaround for r2-6.2.4 headers not being msvc c++ friendly (fixed in r2 master)
+        sed -i 's/(RStrs) { NULL, NULL }/r_strs_new (NULL, NULL)/' radare2/include/libr/r_cmd.h
         pwd
     - name: batmake
       shell: cmd
@@ -235,10 +311,11 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag }}
     needs:
       - linux-deb
+      - linux-arm
       - macos-pkg
       - tarball
       - w64
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -252,7 +329,7 @@ jobs:
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.check_release.outputs.is_release == 'yes' }}
     needs:
       - check_release
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -267,6 +344,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dist/artifacts
+      - name: Packaging r2pm Windows binary
+        run: |
+          V=${{ steps.r2gv.outputs.branch }}
+          mkdir -p w64/plugins
+          unzip -q dist/artifacts/w64/r2ghidra-$V-w64.zip -d w64/plugins
+          unzip -q dist/artifacts/linux-acr-ok/r2ghidra_sleigh-$V.zip -d w64/plugins
+          mv w64/plugins/r2ghidra_sleigh-$V w64/plugins/r2ghidra_sleigh
+          cd w64 && zip -qr ../dist/artifacts/r2ghidra-$V-windows-x86-64.zip plugins
       - name: Create GitHub release and upload assets
         uses: softprops/action-gh-release@v3
         env:
@@ -285,3 +370,5 @@ jobs:
             dist/artifacts/tarball/r2ghidra-${{ steps.r2gv.outputs.branch }}.zip
             dist/artifacts/tarball/r2ghidra-${{ steps.r2gv.outputs.branch }}.tar.xz
             dist/artifacts/linux-acr-ok/r2ghidra_sleigh-${{ steps.r2gv.outputs.branch }}.zip
+            dist/artifacts/bindist-*/r2ghidra-${{ steps.r2gv.outputs.branch }}-*.zip
+            dist/artifacts/r2ghidra-${{ steps.r2gv.outputs.branch }}-windows-x86-64.zip

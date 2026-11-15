@@ -3,6 +3,8 @@
 
 #include "PcodeFixupPreprocessor.h"
 #include "R2LoadImage.h"
+#include "R2FlagCompat.h"
+#include "R2TypeCompat.h"
 #include "R2TypeFactory.h"
 #include "R2Utils.h"
 
@@ -37,19 +39,10 @@ static bool is_import_name(const char * R_NONNULL name) {
 
 // match any import-named flag at addr (an ARM veneer is both loc.imp.foo and rsym.foo)
 static const char *import_flag_at(RCore *core, ut64 addr) {
-	const RList *flags = r_flag_get_list (core->flags, addr);
-	if (!flags) {
-		return nullptr;
-	}
-	RListIter *iter;
-	void *pos;
-	r_list_foreach (flags, iter, pos) {
-		RFlagItem *f = reinterpret_cast<RFlagItem *>(pos);
-		if (f->name && is_import_name (f->name)) {
-			return f->name;
-		}
-	}
-	return nullptr;
+	RFlagItem *flag = r2ghidra_flag_find_at (core->flags, addr, [](RFlagItem *item) {
+		return item->name && is_import_name (item->name);
+	});
+	return flag? flag->name: nullptr;
 }
 
 // strip prefixes/version decorations to the bare libc name (sym.imp.printf, sub.printf, loc.N.plt_call.printf__GLIBC)
@@ -139,10 +132,7 @@ static bool is_indirect_reg_call(RAnalOp *op) {
 static void walk_bb_regflow(RCore *core, RAnalFunction *fn,
 		const std::unordered_map<ut64, ut64> &defs,
 		const std::function<void(RAnalOp *, std::unordered_map<std::string, ut64> &)> &onOp) {
-	RListIter *iter;
-	void *pos;
-	r_list_foreach (fn->bbs, iter, pos) {
-		RAnalBlock *bb = reinterpret_cast<RAnalBlock *> (pos);
+	r_anal_function_bbs_foreach_cpp (fn, [&](RAnalBlock *bb) {
 		std::unordered_map<std::string, ut64> regs;
 		for (int i = 0; i < bb->ninstr; i++) {
 			ut64 at = r_anal_bb_opaddr_i (bb, i);
@@ -163,7 +153,7 @@ static void walk_bb_regflow(RCore *core, RAnalFunction *fn,
 			}
 			r_anal_op_free (op);
 		}
-	}
+	});
 }
 
 void PcodeFixupPreprocessor::fixupSharedReturnJumpToRelocs(RAnalFunction *r2Func, Funcdata *ghFunc, RCore *core, R2Architecture &arch) {
@@ -192,7 +182,7 @@ void PcodeFixupPreprocessor::fixupSharedReturnJumpToRelocs(RAnalFunction *r2Func
 		if (op->type == R_ANAL_OP_TYPE_JMP) {
 			Address callAddr (space, refi->at);
 			R_LOG_INFO ("OverridingCallReturn %s", impname? normalize_callee (impname).c_str (): "(local fcn)");
-			ghFunc->getOverride().insertFlowOverride(callAddr, Override::CALL_RETURN);
+			ghFunc->getOverride().insertFlowOverride(callAddr, Override::CallReturn::NAME);
 		}
 		r_anal_op_free (op);
 	}
@@ -220,7 +210,7 @@ static bool has_data_xref_at(RCore *core, ut64 addr) {
 void PcodeFixupPreprocessor::fixupNoreturnCallsBeforeData(RAnalFunction *r2Func, Funcdata *ghFunc, RCore *core, R2Architecture &arch) {
 	auto space = arch.getDefaultCodeSpace ();
 	const ut64 fcnMax = r_anal_function_max_addr (r2Func);
-	r_list_foreach_cpp<RAnalBlock> (r2Func->bbs, [&](RAnalBlock *bb) {
+	r_anal_function_bbs_foreach_cpp (r2Func, [&](RAnalBlock *bb) {
 		ut64 addr = bb->addr;
 		const ut64 bbend = bb->addr + bb->size;
 		while (addr < bbend) {
@@ -237,7 +227,7 @@ void PcodeFixupPreprocessor::fixupNoreturnCallsBeforeData(RAnalFunction *r2Func,
 			const ut64 next = addr + size;
 			if ((type == R_ANAL_OP_TYPE_CALL || type == R_ANAL_OP_TYPE_UCALL)
 					&& next <= fcnMax && has_data_xref_at (core, next)) {
-				ghFunc->getOverride ().insertFlowOverride (Address (space, addr), Override::CALL_RETURN);
+				ghFunc->getOverride ().insertFlowOverride (Address (space, addr), Override::CallReturn::NAME);
 			}
 			addr = next;
 		}
@@ -271,21 +261,64 @@ void PcodeFixupPreprocessor::fixupResolvedIndirectCalls(RAnalFunction *r2Func, F
 			}
 			auto target = regs.find (tolower (op_first_reg (op, false)));
 			if (target != regs.end ()) {
-				ghFunc->getOverride ().insertIndirectOverride (
+				ghFunc->getOverride ().insertDeindirect (
 					Address (space, op->addr),
 					Address (space, target->second));
 			}
 		});
 }
 
-static bool is_printf_family(const char *name) {
+// PE imports are reached through the IAT: `call qword [sym.imp.KERNEL32.dll_WriteFile]`.
+// radare2 emits a CALL ref from the call site to the import flag, but pcode still renders
+// the call as an indirect dereference `(*_WriteFile)(...)`. Deindirect each such call so
+// the decompiler prints a direct `WriteFile(...)` instead of an indirect pointer dereference.
+void PcodeFixupPreprocessor::fixupImportCallDeindirection(RAnalFunction *r2Func, Funcdata *ghFunc, RCore *core, R2Architecture &arch) {
+	RVecAnalRef *refs = r_anal_function_get_refs (r2Func);
+	if (!refs) {
+		return;
+	}
+	auto space = arch.getDefaultCodeSpace ();
+	RAnalRef *refi;
+	R_VEC_FOREACH (refs, refi) {
+		const int rt = R_ANAL_REF_TYPE_MASK (refi->type);
+		if (rt != R_ANAL_REF_TYPE_CALL && rt != R_ANAL_REF_TYPE_CODE) {
+			continue;
+		}
+		const char *impname = import_flag_at (core, refi->addr);
+		if (!impname) {
+			continue;
+		}
+		ghFunc->getOverride ().insertDeindirect (Address (space, refi->at), Address (space, refi->addr));
+	}
+	RVecAnalRef_free (refs);
+}
+
+static bool name_in_csv(const char *csv, const char *name) {
+	if (R_STR_ISEMPTY (csv)) {
+		return false;
+	}
+	bool found = false;
+	RList *names = r_str_split_duplist (csv, ",", true);
+	if (!names) {
+		return false;
+	}
+	r_list_foreach_cpp<char> (names, [&](char *s) {
+		if (!strcmp (s, name)) {
+			found = true;
+		}
+	});
+	r_list_free (names);
+	return found;
+}
+
+static bool is_format_callee(RCore *core, const char *name) {
 	static const char *fam[] = { "printf", "fprintf", "sprintf", "snprintf", "dprintf" };
 	for (const char *f : fam) {
 		if (!strcmp (name, f)) {
 			return true;
 		}
 	}
-	return false;
+	return name_in_csv (r_config_get (core->config, "r2ghidra.varargs.formats"), name);
 }
 
 static std::string resolve_callee_name(RCore *core, ut64 target) {
@@ -314,7 +347,8 @@ static bool parse_variadic_sig(Sdb *tdb, const char *callee, VariadicSig &sig) {
 	}
 	bool ok = false;
 	if (r_type_func_exist (tdb, fname)) {
-		const int argc = r_type_func_args_count (tdb, fname);
+		int argc = 0;
+		countargs (tdb, fname, &argc);
 		for (int i = 0; i < argc; i++) {
 			// the vararg slot is stored as `,...` so the "..." marker lands in the name, not the type
 			const char *an = r_type_func_args_name (tdb, fname, i);
@@ -543,7 +577,7 @@ static FuncProto *build_locked_proto(R2Architecture &arch, const char *cc, const
 static void override_format_call(RCore *core, R2Architecture &arch, Funcdata *ghFunc, Sdb *tdb,
 		const std::unordered_map<std::string, ut64> &reg_strings, RAnalOp *op, AddrSpace *space) {
 	const std::string callee = resolve_callee_name (core, op->jump);
-	if (callee.empty () || !is_printf_family (callee.c_str ())) {
+	if (callee.empty () || !is_format_callee (core, callee.c_str ())) {
 		return;
 	}
 	VariadicSig sig;
@@ -551,10 +585,12 @@ static void override_format_call(RCore *core, R2Architecture &arch, Funcdata *gh
 		return;
 	}
 	const char *cc = r_anal_cc_func (core->anal, callee.c_str ());
-	if (!cc) {
-		cc = r_anal_cc_default (core->anal);
-	}
 	const char *freg = r_anal_cc_argloc (core->anal, cc, sig.firstVararg - 1, 0, 0);
+	if (!freg && !r_anal_cc_exist (core->anal, cc)) {
+		// the C parsers stamp cc=cdecl on every td/to prototype, and cdecl is undefined outside x86-32
+		cc = r_anal_cc_default (core->anal);
+		freg = r_anal_cc_argloc (core->anal, cc, sig.firstVararg - 1, 0, 0);
+	}
 	auto it = freg? reg_strings.find (tolower (freg)): reg_strings.end ();
 	if (it == reg_strings.end ()) {
 		return;

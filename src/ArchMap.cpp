@@ -143,7 +143,7 @@ static const std::map<std::string, ArchMapper> arch_map = {
 	{ "dalvik", { S("Dalvik"), CUSTOM_FLAVOR((RCore *core) {
 		return DalvikFlavorFromCore (core);
 	}), B(32), E(false), 2, 10 }},
-	{ "hexagon", { S("hexagon"), S("default"), B(32), E(false) } },
+	{ "hexagon", { S("Hexagon"), S("default"), B(32), E(false) } },
 	{ "wasm", { S("wasm"), S("default"), B(32) } },
 	{ "6502", { S("6502"), S("default"), B(16) } },
 	{ "65c02", { S("65c02"), S("default"), B(16) } },
@@ -360,7 +360,7 @@ static std::string sleighIdBaseFromCore(RCore *core) {
 	if (!strcmp (arch, "r2ghidra")) {
 		arch = r_config_get (core->config, "asm.cpu");
 	}
-	std::string a = arch? arch: "";
+	std::string a = tolower (arch? arch: "");
 	const size_t dot = a.find ('.');
 	if (dot != std::string::npos) {
 		a.resize (dot);
@@ -440,26 +440,29 @@ int ai(RCore *core, std::string cpu, int query) {
 }
 
 std::string SleighIdFromSleighAsmConfig(RCore *core, const char *cpu, int bits, bool bigendian, const vector<LanguageDescription> &langs) {
-	const char *colon = strchr (cpu, ':');
-	if (colon != nullptr && colon[1] != '\0') {
+	if (R_STR_ISEMPTY (cpu)) {
+		return std::string ();
+	}
+	if (strchr (cpu, ':')) {
 		// complete id specified
 		return cpu;
 	}
-	auto arch_it = arch_map.find(cpu);
-	if (arch_it != arch_map.end()) {
+	std::string low_cpu = tolower (cpu);
+	auto arch_it = arch_map.find (low_cpu);
+	if (arch_it != arch_map.end ()) {
 		std::string base = arch_it->second.Map (core);
 		return base + ":" + CompilerFromCore (core, base);
 	}
-	// short form if possible
-	std::string low_cpu = tolower (cpu);
+	const LanguageDescription *match = nullptr;
 	for (const auto &lang : langs) {
-		auto proc = lang.getProcessor();
-		if (tolower (proc) == low_cpu) {
-			return proc
-				+ ":" + (bigendian ? "BE" : "LE")
-				+ ":" + to_string (bits)
-				+ ":" + "default";
+		if (lang.getSize () != bits || tolower (lang.getProcessor ()) != low_cpu
+				|| !lang.getId ().ends_with (":default")) {
+			continue;
+		}
+		match = &lang;
+		if (lang.isBigEndian () == bigendian) {
+			break;
 		}
 	}
-	return cpu;
+	return match? match->getId (): cpu;
 }

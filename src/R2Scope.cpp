@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 #include "R2Architecture.h"
+#include "R2FlagCompat.h"
+#include "R2TypeCompat.h"
 #include "R2TypeFactory.h"
 #include "R2Scope.h"
 
+#include <cctype>
+#include <cstring>
 #include <functional>
 #include <funcdata.hh>
 
@@ -13,6 +17,70 @@
 #include <r_core.h>
 
 #include "R2Utils.h"
+
+// Last `<anything>.dll_` separator in a PE import tail, or npos. radare2 6.2
+// joins the DLL name (including its case-insensitive `.dll` suffix) and the
+// function name with `_`, e.g. `KERNEL32.dll_memcpy`,
+// `api_ms_win_crt_stdio_l1_1_0.dll__set_fmode`.
+static size_t findDllSeparator(const std::string &s) {
+	for (size_t i = s.size (); i >= 5; i--) {
+		const size_t pos = i - 5;
+		if (tolower (static_cast<unsigned char> (s[pos])) == '.'
+				&& tolower (static_cast<unsigned char> (s[pos + 1])) == 'd'
+				&& tolower (static_cast<unsigned char> (s[pos + 2])) == 'l'
+				&& tolower (static_cast<unsigned char> (s[pos + 3])) == 'l'
+				&& s[pos + 4] == '_') {
+			return pos;
+		}
+	}
+	return std::string::npos;
+}
+
+// `e r2ghidra.ccode=true` asks for output that is valid C: radare2 names import
+// flags `sym.imp.<lib>_<fn>` / `imp.<lib>_<fn>` / `loc.imp.<fn>` (e.g.
+// `sym.imp.KERNEL32.dll_memcpy`), plus `sub.<lib>_<fn>` stubs and
+// anonymous/dotted symbols `fcn.ADDR` / `sym.lib.fn`, none of which are legal C
+// identifiers. Map those back to bare symbol names so the emitted C uses only
+// legal identifiers.
+static std::string sanitizeCName(const char *raw) {
+	std::string s = raw? raw : "";
+	// Import flags/stubs: sym.imp.<tail> / loc.imp.<tail> / imp.<tail> / sub.<tail>
+	size_t prefix_len = std::string::npos;
+	for (const char *prefix : { "sym.imp.", "loc.imp.", "imp.", "sub." }) {
+		const size_t len = strlen (prefix);
+		if (s.compare (0, len, prefix) == 0) {
+			prefix_len = len;
+			break;
+		}
+	}
+	if (prefix_len != std::string::npos) {
+		s = s.substr (prefix_len);
+		// A PE import embeds the DLL name before the function; drop it through
+		// the real `.dll_` separator, which keeps underscores that belong to
+		// the function (`...dll__set_fmode` -> `_set_fmode`). ELF imports carry
+		// no library name (`sym.imp.pthread_mutex_lock`), so the tail must stay
+		// whole: never split at the first underscore.
+		const size_t dll = findDllSeparator (s);
+		if (dll != std::string::npos) {
+			s = s.substr (dll + 5);
+		}
+	}
+	// Normalize to a legal C identifier. Dots and other illegal characters
+	// become underscores; legitimate leading underscores are preserved.
+	std::string ident;
+	ident.reserve (s.size ());
+	for (char c : s) {
+		const unsigned char uc = static_cast<unsigned char> (c);
+		ident += (isalnum (uc) || c == '_') ? c : '_';
+	}
+	if (ident.empty ()) {
+		return "_";
+	}
+	if (isdigit (static_cast<unsigned char> (ident[0]))) {
+		ident.insert (ident.begin (), '_');
+	}
+	return ident;
+}
 
 R2Scope::R2Scope(R2Architecture *arch)
 		: Scope (0, "", arch, this),
@@ -40,7 +108,7 @@ static Element *childAddr(Element *el, const std::string &name, const Address &a
 	}
 
 	// Join addresses must be marshaled with their physical pieces.
-	JoinRecord *record = space->getManager ()->findJoin (addr.getOffset ());
+	JoinRecord *record = space->findJoin (addr.getOffset ());
 	const int4 numPieces = record->numPieces ();
 	constexpr int4 maxMarshaledJoinPieces = 64; // JoinSpace::MAX_PIECES is private.
 	if (numPieces > maxMarshaledJoinPieces) {
@@ -260,14 +328,14 @@ struct FunctionVars {
 		return index;
 	}
 	Element *emitSymbol(Element *symbollistElement, const std::string &name, Datatype *type, const Address &a,
-			const char *typelock, const char *readonly, const char *cat, int4 index,
+			const char *typelock, const char *cat, int4 index,
 			bool add_reg_range, const std::function<void(Element *)> &childRegRange) {
 		auto mapsymElement = child (symbollistElement, "mapsym");
+		// no readonly attribute: it would let the decompiler constant-fold reads of the variable
 		auto symbolElement = child (mapsymElement, "symbol", {
 			{ "name", name },
 			{ "typelock", typelock },
 			{ "namelock", "true" },
-			{ "readonly", readonly },
 			{ "cat", cat }
 		});
 		if (index >= 0) {
@@ -320,13 +388,17 @@ struct FunctionVars {
 				typelock = false;
 			}
 
+			// Array extents do not prove that adjacent stack storage is unaliased.
+			if (!var->isarg && type->getMetatype () == TYPE_ARRAY && arch->alias_block_level > 1) {
+				arch->alias_block_level = 1;
+			}
 			ranges.insertRange (sa.getSpace (), sa.getOffset (), last);
 
 			Element *symbolElement = emitSymbol (symbollistElement, var->name, type, sa,
-				typelock ? "true" : "false", "true", var->isarg ? "0" : "-1", index,
+				typelock ? "true" : "false", var->isarg ? "0" : "-1", index,
 				var->isarg && var->kind == R_ANAL_VAR_KIND_REG, childRegRange);
 			if (var->isarg) {
-				if (argsByIndex.size () < index + 1) {
+				if (argsByIndex.size () < (size_t)index + 1) {
 					argsByIndex.resize (index + 1, nullptr);
 				}
 				argsByIndex[index] = symbolElement;
@@ -346,7 +418,7 @@ struct FunctionVars {
 				continue;
 			}
 			emitSymbol (symbollistElement, "noname_" + to_string (i), type, trial.getAddress (),
-				"true", "false", "0", i, trial.getAddress ().getSpace () != arch->translate->getStackSpace (),
+				"true", "0", i, trial.getAddress ().getSpace () != arch->translate->getStackSpace (),
 				childRegRange);
 		}
 	}
@@ -406,7 +478,8 @@ static void processFunctionSignature(
 		if (fname && r_type_func_exist (tdb, fname)) {
 			// a cc key marks an afs-set prototype; auto-inferred and library types have none
 			explicit_proto = sdb_const_get (tdb, ("func." + std::string (fname) + ".cc").c_str (), nullptr) != nullptr;
-			const int argc = r_type_func_args_count (tdb, fname);
+			int argc = 0;
+			countargs (tdb, fname, &argc);
 			for (int i = 0; i < argc; i++) {
 				char *arg_type = r_type_func_args_type (tdb, fname, i);
 				if (!arg_type) {
@@ -510,7 +583,6 @@ static void processFunctionSignature(
 				{ "name", arg.name },
 				{ "typelock", "true" },
 				{ "namelock", "true" },
-				{ "readonly", "true" },
 				{ "cat", "0" },
 				{ "index", to_string (sig_index - 1) }
 			});
@@ -535,24 +607,40 @@ static void processFunctionSignature(
 }
 #endif
 
-static bool noreturnTakesArgs(RCore *core, RAnalFunction *fcn, const char *fcn_name) {
+static bool protoHasNoArgs(RCore *core, const char *name) {
+	Sdb *tdb = core->anal->sdb_types;
+	char *key = r_type_func_key (tdb, name);
+	int argc = 0;
+	// a missing args key is an unknown prototype, not an empty one
+	const bool noArgs = key && countargs (tdb, key, &argc) && !argc;
+	free (key);
+	return noArgs;
+}
+
+// Ghidra does active param recovery unless input is locked, so a no-arg noreturn (eg __stack_chk_fail) would otherwise get a live caller reg as a phantom arg
+static void markNoReturn(FunctionSymbol *funcsym, bool lockNoArgs) {
+	Funcdata *fd = funcsym? funcsym->getFunction (): nullptr;
+	if (!fd) {
+		return;
+	}
+	FuncProto &fp = fd->getFuncProto ();
+	fp.setNoReturn (true);
+	if (lockNoArgs) {
+		fp.clearInput ();
+		fp.setInputLock (true);
+	}
+}
+
+static bool noreturnHasNoArgs(RCore *core, RAnalFunction *fcn, const char *fcn_name) {
 	RAnalVar **it;
 	R_VEC_FOREACH (&fcn->vars, it) {
 		RAnalVar *v = *it;
 		// a ppc PLT stub's TOC save lands a spurious stack arg, so only a register arg counts
 		if (v && v->isarg && v->kind == R_ANAL_VAR_KIND_REG) {
-			return true;
+			return false;
 		}
 	}
-	Sdb *tdb = core->anal->sdb_types;
-	char *fname = r_type_func_guess (tdb, fcn_name);
-	if (!fname) {
-		return false;
-	}
-	// args_count is 0 for both unknown and zero-arg protos, so > 0 alone tells real arg-takers apart
-	bool has_args = r_type_func_args_count (tdb, fname) > 0;
-	free (fname);
-	return has_args;
+	return protoHasNoArgs (core, fcn_name);
 }
 
 FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
@@ -563,7 +651,6 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 	if (archName != nullptr && !strcmp (archName, "r2ghidra")) {
 		archName = r_config_get (core->config, "asm.cpu");
 	}
-	const std::string r2Arch (archName);
 
 	// We use xml here, because the public interface for Functions
 	// doesn't let us set up the scope parenting as we need it :-(
@@ -571,33 +658,33 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 	Document doc;
 	doc.setName ("mapsym");
 
-	if (fcn->bits == 16 && !r2Arch.compare ("arm")) {
+	if (fcn->bits == 16 && !r_str_casecmp (archName, "arm")) {
 		ContextDatabase *cdb = arch->getContextDatabase ();
 		cdb->setVariable ("TMode", Address (arch->getDefaultCodeSpace (), fcn->addr), 1);
 	}
 
+	// like registerFunctionFlag/registerFlag, prefer radare2's clean realname
+	// when the user asked for clean output. Resolved-symbol flags carry their
+	// own namespaced name as realname (`rsym.__libc_init`), so only a realname
+	// that actually differs from the raw flag name is an improvement.
+	const bool ccode = r_config_get_b (core->config, "r2ghidra.ccode");
 	const char *fcn_name = fcn->name;
-	if (core->flags->realnames) {
-		const RList *flags = r_flag_get_list (core->flags, fcn->addr);
-		if (flags) {
-			RListIter *iter;
-			void *pos;
-			r_list_foreach (flags, iter, pos) {
-				auto flag = reinterpret_cast<RFlagItem *>(pos);
-				if (flag->space && flag->space->name && !strcmp(flag->space->name, R_FLAGS_FS_SECTIONS)) {
-					continue;
-				}
-				// if (!strcmp(flag->name, fcn->name) && flag->realname && *flag->realname)
-				if (R_STR_ISNOTEMPTY (flag->realname)) {
-					fcn_name = flag->realname;
-					break;
-				}
-			}
+	if (core->flags->realnames || ccode) {
+		RFlagItem *flag = r2ghidra_flag_find_at (core->flags, fcn->addr, [](RFlagItem *item) {
+			return (!item->space || !item->space->name || strcmp (item->space->name, R_FLAGS_FS_SECTIONS))
+				&& R_STR_ISNOTEMPTY (item->realname)
+				&& strcmp (item->realname, item->name);
+		});
+		if (flag) {
+			fcn_name = flag->realname;
 		}
 	}
 
+	std::string fcn_display = ccode ? sanitizeCName (fcn_name) : fcn_name;
+	const char *fcn_display_name = fcn_display.c_str ();
+
 	auto functionElement = child (&doc, "function", {
-		{ "name", fcn_name },
+		{ "name", fcn_display_name },
 		{ "size", "1" },
 		{ "id", hex (makeId()) }
 	});
@@ -610,7 +697,7 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 	});
 
 	auto scopeElement = child(localDbElement, "scope", {
-		{ "name", fcn_name }
+		{ "name", fcn_display_name }
 	});
 
 	auto parentElement = child(scopeElement, "parent", {
@@ -676,17 +763,13 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 	});
 
 	Address returnAddr(arch->getSpaceByName("register"), 0);
-	bool returnFound = false;
 	if (proto) {
 		for (auto it = proto->effectBegin (); it != proto->effectEnd(); it++) {
 			if (it->getType() == EffectRecord::return_address) {
 				returnAddr = it->getAddress();
-				returnFound = true;
 				break;
 			}
 		}
-		//if (!returnFound)
-		//	arch->addWarning("Failed to find return address in ProtoModel");
 	}
 	// TODO: should we try to get the return address from r2's cc?
 
@@ -720,23 +803,35 @@ FunctionSymbol *R2Scope::registerFunction(RAnalFunction *fcn) const {
 			fd->getFuncProto().setPieces(sig_proto);
 		}
 	}
-	// Ghidra does active param recovery unless input is locked, so a no-arg noreturn (eg __stack_chk_fail) would otherwise get a live caller reg as a phantom arg
-	if (funcsym && fcn->is_noreturn && !noreturnTakesArgs (core, fcn, fcn_name)) {
+	if (fcn->is_noreturn) {
+		markNoReturn (funcsym, noreturnHasNoArgs (core, fcn, fcn_name));
+	}
+#if R2_ABIVERSION >= 163
+	if (funcsym && r_config_get_b (core->config, "r2ghidra.inline") && r_anal_function_is_inline (fcn)) {
 		if (Funcdata *fd = funcsym->getFunction ()) {
-			FuncProto &fp = fd->getFuncProto ();
-			fp.setNoReturn (true);
-			fp.clearInput ();
-			fp.setInputLock (true);
+			fd->getFuncProto ().setInline (true);
 		}
 	}
+#endif
 	return funcsym;
 }
 
 FunctionSymbol *R2Scope::registerFunctionFlag(RFlagItem *flag) const {
 	RCoreLock core (arch->getCore ());
-	const char *name = (core->flags->realnames && flag->realname)
+	// radare2 stores the clean import/demangled name in realname; prefer it over the
+	// sym.imp.<lib>_<fn> / mangled flag name when requesting clean output.
+	bool ccode = r_config_get_b (core->config, "r2ghidra.ccode");
+	const char *name = ((core->flags->realnames || ccode) && flag->realname)
 		? flag->realname : flag->name;
-	return cache->addFunction (Address (arch->getDefaultCodeSpace (), flag->addr), name);
+	std::string clean = name;
+	if (ccode) {
+		clean = sanitizeCName (name);
+	}
+	FunctionSymbol *funcsym = cache->addFunction (Address (arch->getDefaultCodeSpace (), flag->addr), clean.c_str ());
+	if (r_anal_noreturn_at (core->anal, flag->addr)) {
+		markNoReturn (funcsym, protoHasNoArgs (core, name));
+	}
+	return funcsym;
 }
 
 Symbol *R2Scope::registerFlag(RFlagItem *flag) const {
@@ -774,10 +869,20 @@ Symbol *R2Scope::registerFlag(RFlagItem *flag) const {
 	}
 
 	// Check whether flags should be displayed by their real name
-	const char *name = (core->flags->realnames && flag->realname) ? flag->realname : flag->name;
+	bool ccode = r_config_get_b (core->config, "r2ghidra.ccode");
+	const char *name = ((core->flags->realnames || ccode) && flag->realname) ? flag->realname : flag->name;
+	std::string clean = name;
+	if (ccode) {
+		clean = sanitizeCName (name);
+	}
 
 	const ut64 at = flag->addr;
-	SymbolEntry *entry = cache->addSymbol (name, type, Address (arch->getDefaultCodeSpace(), at), Address());
+	// a mapping whose end wraps below its start would throw out of addSymbol and abort the decompilation
+	if (type->getSize () > 0 && at + type->getSize () - 1 < at) {
+		arch->addWarning ("Flag " + to_string (name) + " extends beyond the end of the address space");
+		return nullptr;
+	}
+	SymbolEntry *entry = cache->addSymbol (clean.c_str (), type, Address (arch->getDefaultCodeSpace(), at), Address());
 	if (entry == nullptr) {
 		return nullptr;
 	}
@@ -834,6 +939,10 @@ Symbol *R2Scope::registerGlobalVar(RFlagItem *glob, const char *type_str) const 
 
 	const char *name = (core->flags->realnames && glob->realname)
 		? glob->realname : glob->name;
+	if (type->getSize () > 0 && addr + type->getSize () - 1 < addr) {
+		arch->addWarning ("Global " + to_string (name) + " extends beyond the end of the address space");
+		return nullptr;
+	}
 	SymbolEntry *entry = cache->addSymbol (name, type,
 		Address (arch->getDefaultCodeSpace (), addr), Address ());
 	if (!entry) {
@@ -869,24 +978,17 @@ Symbol *R2Scope::queryR2Absolute(ut64 addr, bool contain) const {
 		return registerFunction (fcn);
 	}
 
-	{
-		const RList *flags = r_flag_get_list (core->flags, addr);
-		if (flags) {
-			const bool execok = r_io_is_valid_offset (core->io, addr, R_PERM_X);
-			RListIter *iter;
-			void *pos;
-			r_list_foreach (flags, iter, pos) {
-				auto flag = reinterpret_cast<RFlagItem *>(pos);
-				if (flag->space && flag->space->name
-						&& (!strcmp (flag->space->name, R_FLAGS_FS_SECTIONS)
-						|| !strcmp (flag->space->name, R_FLAGS_FS_STRINGS))) {
-					continue;
-				}
-				if (execok || is_reloc_or_import_flag (flag)) {
-					return registerFunctionFlag (flag);
-				}
-			}
+	const bool execok = r_io_is_valid_offset (core->io, addr, R_PERM_X);
+	RFlagItem *flag = r2ghidra_flag_find_at (core->flags, addr, [execok](RFlagItem *item) {
+		if (item->space && item->space->name
+				&& (!strcmp (item->space->name, R_FLAGS_FS_SECTIONS)
+				|| !strcmp (item->space->name, R_FLAGS_FS_STRINGS))) {
+			return false;
 		}
+		return execok || is_reloc_or_import_flag (item);
+	});
+	if (flag) {
+		return registerFunctionFlag (flag);
 	}
 
 	RFlagItem *glob = r_anal_global_get (core->anal, addr);
@@ -898,19 +1000,10 @@ Symbol *R2Scope::queryR2Absolute(ut64 addr, bool contain) const {
 	}
 
 	// TODO: correctly handle contain for flags
-	const RList *flags = r_flag_get_list (core->flags, addr);
-	if (flags) {
-		RListIter *iter;
-		void *pos;
-		r_list_foreach (flags, iter, pos) {
-			auto flag = reinterpret_cast<RFlagItem *>(pos);
-			if (flag->space && flag->space->name && !strcmp (flag->space->name, R_FLAGS_FS_SECTIONS)) {
-				continue;
-			}
-			return registerFlag (flag);
-		}
-	}
-	return nullptr;
+	flag = r2ghidra_flag_find_at (core->flags, addr, [](RFlagItem *item) {
+		return !item->space || !item->space->name || strcmp (item->space->name, R_FLAGS_FS_SECTIONS);
+	});
+	return flag? registerFlag (flag): nullptr;
 }
 
 Symbol *R2Scope::queryR2(const Address &addr, bool contain) const {
@@ -934,8 +1027,8 @@ LabSymbol *R2Scope::queryR2FunctionLabel(const Address &addr) const {
 	return nullptr;
 }
 
-SymbolEntry *R2Scope::findAddr(const Address &addr, const Address &usepoint) const {
-	SymbolEntry *entry = cache->findAddr(addr,usepoint);
+MapEntry *R2Scope::findAddr(const Address &addr, const Address &usepoint) const {
+	MapEntry *entry = cache->findAddr(addr,usepoint);
 	if (entry) {
 		return entry->getAddr() == addr ? entry : nullptr;
 	}
@@ -949,8 +1042,8 @@ SymbolEntry *R2Scope::findAddr(const Address &addr, const Address &usepoint) con
 	return (entry && entry->getAddr() == addr) ? entry : nullptr;
 }
 
-SymbolEntry *R2Scope::findContainer(const Address &addr, int4 size, const Address &usepoint) const {
-	SymbolEntry *entry = cache->findClosestFit (addr, size, usepoint);
+MapEntry *R2Scope::findContainer(const Address &addr, int4 size, const Address &usepoint) const {
+	MapEntry *entry = cache->findClosestFit (addr, size, usepoint);
 	if (!entry) {
 		Symbol *sym = queryR2 (addr, true);
 		entry = sym ? sym->getMapEntry (addr) : nullptr;

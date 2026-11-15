@@ -10,6 +10,7 @@
 
 #include <r_core.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -50,9 +51,9 @@ public:
 };
 
 struct PcodeOperand {
-	PcodeOperand(uintb offset, uint4 size): type(RAM), offset(offset), size(size) {}
-	PcodeOperand(uintb number): type(CONSTANT), number(number), size(0) {}
-	PcodeOperand(const std::string &name, uint4 size): type(REGISTER), name(name), size(size) {}
+	PcodeOperand(uintb offset, uint4 size): offset(offset), size(size), type(RAM) {}
+	PcodeOperand(uintb number): number(number), size(0), type(CONSTANT) {}
+	PcodeOperand(const std::string &name, uint4 size): name(name), size(size), type(REGISTER) {}
 	virtual ~PcodeOperand() {
 		if (type == REGISTER) {
 			name.~string();
@@ -65,6 +66,9 @@ struct PcodeOperand {
 		uintb number;
 	};
 	uint4 size;
+	// location in the register space, to find overlapping registers
+	uintb reg_offset = 0;
+	bool reg_big_endian = false;
 
 	enum {
 		REGISTER,
@@ -76,6 +80,8 @@ struct PcodeOperand {
 	PcodeOperand(const PcodeOperand &rhs) {
 		type = rhs.type;
 		size = rhs.size;
+		reg_offset = rhs.reg_offset;
+		reg_big_endian = rhs.reg_big_endian;
 
 		switch (type) {
 		case REGISTER: new (&name) std::string(rhs.name); break;
@@ -93,6 +99,8 @@ struct PcodeOperand {
 			}
 			type = rhs.type;
 			size = rhs.size;
+			reg_offset = rhs.reg_offset;
+			reg_big_endian = rhs.reg_big_endian;
 			switch (type) {
 			case REGISTER: new (&name) std::string(rhs.name); break;
 			case UNIQUE:
@@ -135,7 +143,7 @@ struct Pcodeop {
 	/* input2 for STORE will use output to save memory space */
 
 	Pcodeop(PcodeOpType opc, PcodeOperand *in0, PcodeOperand *in1, PcodeOperand *out):
-	    type(opc), input0(in0), input1(in1), output(out) {
+	    type(opc), output(out), input0(in0), input1(in1) {
 	}
 
 	void fini() {
@@ -204,8 +212,6 @@ struct R2Reg {
 	ut64 offset;
 };
 
-class R2Sleigh;
-
 class SleighAsm {
 private:
 	AsmLoadImage loader;
@@ -216,7 +222,7 @@ private:
 	std::vector<LanguageDescription> description;
 	int languageindex;
 
-	void initInner(RIO *io, std::string sleigh_id);
+	void initInner(RIO *io, const std::string &id);
 	void initRegMapping(void);
 	void collectSpecfiles(void);
 	void scanSleigh(const string &rootpath);
@@ -228,7 +234,7 @@ private:
 
 public:
 	static std::string getSleighHome(RConfig *cfg);
-	R2Sleigh trans;
+	std::unique_ptr<R2Sleigh> trans;
 	std::string sleigh_id;
 	int alignment = 1;
 	int minopsz = 1;
@@ -240,7 +246,7 @@ public:
 	std::unordered_map<std::string, std::string> reg_group;
 	// To satisfy radare2's rule: reg name has to be lowercase.
 	std::unordered_map<std::string, std::string> reg_mapping;
-	SleighAsm(): loader(nullptr), trans(nullptr, nullptr) {}
+	SleighAsm(): loader(nullptr) {}
 	void init(const char *cpu, int bits, bool bigendian, RIO *io, RConfig *cfg);
 	int disassemble(RAnalOp *op, unsigned long long offset);
 	int genOpcode(PcodeSlg &pcode_slg, Address &addr);
